@@ -465,7 +465,7 @@ if __name__ == "__main__":
     run_baseline_comparison(results, gcn_results, output_dir=plots_dir)
 
     # ── Ablation study ───────────────────────────────────────────
-    run_ablation(results, output_dir=plots_dir)
+    run_ablation(results, output_dir=plots_dir, gcn_results=gcn_results)
 
     # ── Driver gene analysis — which genes drive risk? ────────────
     run_driver_gene_analysis(

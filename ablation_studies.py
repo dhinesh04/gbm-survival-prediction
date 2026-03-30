@@ -92,7 +92,8 @@ def _run_gcn(X_train_np, y_train_np,
              times_train, events_train,
              times_test,  events_test,
              class_weights: torch.Tensor,
-             label: str) -> dict:
+             label: str
+             ) -> dict:
     """
     5-fold CV + final retrain + test evaluation for one ablation config.
 
@@ -163,6 +164,7 @@ def _run_gcn(X_train_np, y_train_np,
         fold_threshs.append(best_thresh)
         fold_epochs.append(best_ep)
 
+
     final_epochs = max(MIN_EPOCHS, int(np.median(fold_epochs)))
     mean_val_auc = float(np.mean(fold_aucs))
 
@@ -224,7 +226,7 @@ def _print_summary(results: list):
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
-def run_ablation(pipeline: dict, output_dir: str = "plots") -> list:
+def run_ablation(pipeline: dict, output_dir: str = "plots", gcn_results: dict = None) -> list:
     """
     Run all 7 ablation configurations and produce the combined ROC plot.
 
@@ -319,14 +321,34 @@ def run_ablation(pipeline: dict, output_dir: str = "plots") -> list:
         t_tr, e_tr, t_te, e_te, class_weights, label="All 4 + SNF (no surv-aware)"
     ))
 
-    # A7 — Full model (reuse psn_real already built in main) ──────────────────
+    # A7 — Full model: inject results from the main GCN run directly.
+    # Re-running _run_gcn here would produce different results due to
+    # RNG state divergence after CV folds, even with an identical epoch count.
+    # Using gcn_results guarantees Table 1 and Table 3 are always consistent.
     print("── A7: All 4 + SNF-SA (FULL MODEL) ────────────────────────────")
-    X_tr = np.hstack([cna_tr,  mrna_tr,  meth_tr,  clin_tr])
-    X_te = np.hstack([cna_te,  mrna_te,  meth_te,  clin_te])
-    results.append(_run_gcn(
-        X_tr, y_tr, X_te, y_te, pipeline["psn_real"],
-        t_tr, e_tr, t_te, e_te, class_weights, label="All 4 + SNF-SA (Full model)"
-    ))
+    if gcn_results is not None:
+        a7 = {
+            "label":       "All 4 + SNF-SA (Full model)",
+            "auc":         gcn_results["auc"],
+            "cindex":      gcn_results["cindex"],
+            "probs":       gcn_results["probs"],
+            "y_true":      gcn_results["y_true"],
+            "cv_auc_mean": gcn_results["cv_val_auc_mean"],
+            "cv_auc_std":  gcn_results["cv_val_auc_std"],
+        }
+        print(f"  [{'All 4 + SNF-SA (Full model)':45s}]  "
+              f"AUC={a7['auc']:.4f}  C-index={a7['cindex']:.4f}  "
+              f"(CV AUC={a7['cv_auc_mean']:.4f}  "
+              f"epochs={gcn_results['final_epochs_used']})")
+    else:
+        X_tr = np.hstack([cna_tr, mrna_tr, meth_tr, clin_tr])
+        X_te = np.hstack([cna_te, mrna_te, meth_te, clin_te])
+        a7 = _run_gcn(
+            X_tr, y_tr, X_te, y_te, pipeline["psn_real"],
+            t_tr, e_tr, t_te, e_te, class_weights,
+            label="All 4 + SNF-SA (Full model)"
+        )
+    results.append(a7)
 
     # ── Summary + Plot ───────────────────────────────────────────────────────
     _print_summary(results)
