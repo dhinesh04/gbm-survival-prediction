@@ -51,7 +51,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.metrics        import roc_auc_score
 
 from config import RANDOM_STATE
-from utils import concordance_index, plot_roc_curves
+from src.utils import concordance_index, plot_roc_curves
 
 warnings.filterwarnings("ignore")
 

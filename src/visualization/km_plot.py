@@ -17,7 +17,7 @@ matplotlib.use('Agg')
 
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test, multivariate_logrank_test
-from utils import significance_stars
+from src.utils import significance_stars
 
 
 def plot_km_median_split(risk_scores: np.ndarray,

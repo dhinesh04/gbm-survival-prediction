@@ -6,12 +6,14 @@
 # All output is logged to logs/experiment_<timestamp>.log
 #
 
+export PYTHONPATH="$(pwd)"
+
 set -e  # exit immediately if any command fails
 
 # ── Log setup ────────────────────────────────────────────────────────────────
-mkdir -p logs
+mkdir -p src/outputs/logs
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="logs/experiment_${TIMESTAMP}.log"
+LOG_FILE="src/outputs/logs/experiment_${TIMESTAMP}.log"
 
 # Redirect ALL output (stdout + stderr) through tee so it prints to terminal
 # AND writes to the log file simultaneously
@@ -54,17 +56,17 @@ for T in $THRESHOLDS; do
 
     echo ""
     echo "--- Step 1/2: Data Processing (threshold=${T}m) ---"
-    python data_processing.py --threshold $T --output_dir data_${T}m $MUTATION_FLAG
+    python src/data/data_processing.py --threshold $T --output_dir src/data/data_${T}m $MUTATION_FLAG
 
     echo ""
     echo "--- Step 2/2: Main Pipeline + GCN (threshold=${T}m) ---"
-    python main.py --threshold $T --data_dir data_${T}m --plots_dir plots_${T}m $MUTATION_FLAG
+    python main.py --threshold $T --data_dir src/data/data_${T}m --plots_dir src/outputs/plots_${T}m $MUTATION_FLAG
 
     THRESHOLD_ELAPSED=$(( SECONDS - THRESHOLD_START ))
     echo ""
     echo "  ✓ Threshold ${T}m done in $(( THRESHOLD_ELAPSED / 60 ))m $(( THRESHOLD_ELAPSED % 60 ))s"
-    echo "    data  -> data_${T}m/"
-    echo "    plots -> plots_${T}m/"
+    echo "    data  -> src/data/data_${T}m/"
+    echo "    plots -> src/outputs/plots_${T}m/"
 done
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -78,7 +80,7 @@ echo "  Total time: $(( TOTAL_ELAPSED / 60 ))m $(( TOTAL_ELAPSED % 60 ))s"
 echo ""
 echo "  Output directories:"
 for T in $THRESHOLDS; do
-    echo "    ${T}m  ->  data_${T}m/  |  plots_${T}m/"
+    echo "    ${T}m  ->  src/data/data_${T}m/  |  src/outputs/plots_${T}m/"
 done
 echo ""
 echo "  Full log saved to: $LOG_FILE"

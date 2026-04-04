@@ -33,13 +33,13 @@ from config import (
     N_PERMUTATIONS, ALPHA_SURVIVAL,
     DEFAULT_DATA_DIR, DEFAULT_PLOTS_DIR,
 )
-from feature_selection_mrmr import run_mrmr_all_modalities
-from gcn_train import train_gcn
-from km_plot import generate_all_km_plots
-from baseline_comparison import run_baseline_comparison
-from survival_aware_psn import build_survival_aware_psn, compare_psn_diagnostics
-from ablation_studies import run_ablation
-from driver_gene_analysis import run_driver_gene_analysis
+from src.data.feature_selection_mrmr import run_mrmr_all_modalities
+from src.models.gcn_train import train_gcn
+from src.visualization.km_plot import generate_all_km_plots
+from src.graph.survival_aware_psn import build_survival_aware_psn, compare_psn_diagnostics
+from src.analysis.baseline_comparison import run_baseline_comparison
+from src.analysis.ablation_studies import run_ablation
+from src.analysis.driver_gene_analysis import run_driver_gene_analysis
 
 
 # ─────────────────────────────────────────────────────────────────────────────

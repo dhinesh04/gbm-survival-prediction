@@ -38,8 +38,8 @@ import snf
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, f1_score
 
-from gcn_model import GCN
-from survival_aware_psn import build_survival_aware_psn
+from src.models.gcn_model import GCN
+from src.graph.survival_aware_psn import build_survival_aware_psn
 from config import (
     HIDDEN_DIM, DROPOUT, LR, WEIGHT_DECAY,
     EPOCHS, PATIENCE, MIN_EPOCHS,
@@ -48,7 +48,7 @@ from config import (
     K_SNF, MU_SNF, N_ITER_SNF,
     ALPHA_SURVIVAL,
 )
-from utils import (
+from src.utils import (
     concordance_index,
     cox_partial_likelihood_loss,
     normalise_adjacency,

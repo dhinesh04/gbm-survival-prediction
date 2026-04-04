@@ -26,7 +26,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (roc_auc_score, f1_score, confusion_matrix,
                              balanced_accuracy_score)
 from lifelines.statistics import logrank_test
-from gcn_model import GCN
+from src.models.gcn_model import GCN
 
 from config import (
     HIDDEN_DIM, DROPOUT, LR, WEIGHT_DECAY,
@@ -35,7 +35,7 @@ from config import (
     ALPHA_BIN, ALPHA_COX,
     RANDOM_STATE,
 )
-from utils import (
+from src.utils import (
     concordance_index,
     cox_partial_likelihood_loss,
     normalise_adjacency,
