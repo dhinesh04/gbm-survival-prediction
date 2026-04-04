@@ -1,2 +1,4 @@
 env/
 __pycache__/
+outputs/
+src/data/data_*/
