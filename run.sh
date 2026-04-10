@@ -2,24 +2,39 @@
 # run.sh
 # ------------------
 # Runs the full GBM pipeline for LTS thresholds: 12, 18, and 24 months.
-# Each threshold gets its own data and plots directory.
-# All output is logged to logs/experiment_<timestamp>.log
+# Every invocation creates a self-contained, timestamped run folder:
 #
+#   src/outputs/runs/<TIMESTAMP>/
+#     logs/   — experiment log
+#     data/   — processed CSVs per threshold  (data_12m/, data_18m/, ...)
+#     plots/  — figures per threshold          (plots_12m/, plots_18m/, ...)
+#
+# Nothing outside that folder is written, so re-runs never overwrite old results.
+#
+# Usage
+# -----
+#   bash run.sh                          # thresholds 12 18 24
+#   bash run.sh 12 18                    # custom subset
+#   bash run.sh --use_mutations          # include mutation modality
+#   bash run.sh 12 --use_mutations       # both
 
 export PYTHONPATH="$(pwd)"
-
 set -e  # exit immediately if any command fails
 
-# ── Log setup ────────────────────────────────────────────────────────────────
-mkdir -p src/outputs/logs
+# ── Create a unique run folder ────────────────────────────────────────────────
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="src/outputs/logs/experiment_${TIMESTAMP}.log"
+RUN_DIR="src/outputs/runs/${TIMESTAMP}"
 
-# Redirect ALL output (stdout + stderr) through tee so it prints to terminal
-# AND writes to the log file simultaneously
+mkdir -p "${RUN_DIR}/logs"
+mkdir -p "${RUN_DIR}/data"
+mkdir -p "${RUN_DIR}/plots"
+
+LOG_FILE="${RUN_DIR}/logs/experiment.log"
+
+# Redirect ALL output through tee → terminal + log file simultaneously
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# ── Start ─────────────────────────────────────────────────────────────────────
+# ── Parse arguments ───────────────────────────────────────────────────────────
 USE_MUTATIONS=false
 THRESHOLD_ARGS=()
 for ARG in "$@"; do
@@ -29,24 +44,32 @@ for ARG in "$@"; do
         THRESHOLD_ARGS+=("$ARG")
     fi
 done
-THRESHOLDS=${THRESHOLD_ARGS[@]:-12 18 24}
+THRESHOLDS="${THRESHOLD_ARGS[*]:-12 18 24}"
 MUTATION_FLAG=""
 if [ "$USE_MUTATIONS" = true ]; then
     MUTATION_FLAG="--use_mutations"
 fi
+
 EXPERIMENT_START=$SECONDS
 
 echo "============================================================"
 echo "  GBM Experiment Run"
-echo "  Started  : $(date '+%Y-%m-%d %H:%M:%S')"
-echo "  Log file : $LOG_FILE"
-echo "  Thresholds: $THRESHOLDS"
-echo "  Mutation mode: $USE_MUTATIONS"
+echo "  Started   : $(date '+%Y-%m-%d %H:%M:%S')"
+echo "  Run folder: ${RUN_DIR}/"
+echo "  Log file  : ${LOG_FILE}"
+echo "  Thresholds: ${THRESHOLDS}"
+echo "  Mutations : ${USE_MUTATIONS}"
 echo "============================================================"
 
 # ── Per-threshold loop ────────────────────────────────────────────────────────
 for T in $THRESHOLDS; do
     THRESHOLD_START=$SECONDS
+
+    DATA_DIR="${RUN_DIR}/data/data_${T}m"
+    PLOTS_DIR="${RUN_DIR}/plots/plots_${T}m"
+
+    mkdir -p "$DATA_DIR"
+    mkdir -p "$PLOTS_DIR"
 
     echo ""
     echo "============================================================"
@@ -56,17 +79,24 @@ for T in $THRESHOLDS; do
 
     echo ""
     echo "--- Step 1/2: Data Processing (threshold=${T}m) ---"
-    python src/data/data_processing.py --threshold $T --output_dir src/data/data_${T}m $MUTATION_FLAG
+    python src/data/data_processing.py \
+        --threshold  "$T" \
+        --output_dir "$DATA_DIR" \
+        $MUTATION_FLAG
 
     echo ""
     echo "--- Step 2/2: Main Pipeline + GCN (threshold=${T}m) ---"
-    python main.py --threshold $T --data_dir src/data/data_${T}m --plots_dir src/outputs/plots_${T}m $MUTATION_FLAG
+    python main.py \
+        --threshold  "$T" \
+        --data_dir   "$DATA_DIR" \
+        --plots_dir  "$PLOTS_DIR" \
+        $MUTATION_FLAG
 
     THRESHOLD_ELAPSED=$(( SECONDS - THRESHOLD_START ))
     echo ""
     echo "  ✓ Threshold ${T}m done in $(( THRESHOLD_ELAPSED / 60 ))m $(( THRESHOLD_ELAPSED % 60 ))s"
-    echo "    data  -> src/data/data_${T}m/"
-    echo "    plots -> src/outputs/plots_${T}m/"
+    echo "    data  -> ${DATA_DIR}/"
+    echo "    plots -> ${PLOTS_DIR}/"
 done
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -75,13 +105,14 @@ TOTAL_ELAPSED=$(( SECONDS - EXPERIMENT_START ))
 echo ""
 echo "============================================================"
 echo "  All experiments complete!"
-echo "  Finished : $(date '+%Y-%m-%d %H:%M:%S')"
+echo "  Finished  : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  Total time: $(( TOTAL_ELAPSED / 60 ))m $(( TOTAL_ELAPSED % 60 ))s"
 echo ""
-echo "  Output directories:"
+echo "  Run folder: ${RUN_DIR}/"
+echo "  Output layout:"
 for T in $THRESHOLDS; do
-    echo "    ${T}m  ->  src/data/data_${T}m/  |  src/outputs/plots_${T}m/"
+    echo "    ${T}m  ->  ${RUN_DIR}/data/data_${T}m/"
+    echo "          ->  ${RUN_DIR}/plots/plots_${T}m/"
 done
-echo ""
-echo "  Full log saved to: $LOG_FILE"
+echo "    log  ->  ${LOG_FILE}"
 echo "============================================================"
