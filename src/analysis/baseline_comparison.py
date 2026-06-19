@@ -39,14 +39,14 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model  import LogisticRegression
-from sklearn.naive_bayes   import GaussianNB
-from sklearn.neighbors     import KNeighborsClassifier
-from sklearn.tree          import DecisionTreeClassifier
-from sklearn.ensemble      import (RandomForestClassifier,
-                                   HistGradientBoostingClassifier)
-from sklearn.svm           import SVC
+from sklearn.preprocessing  import StandardScaler
+from sklearn.linear_model   import LogisticRegression
+from sklearn.naive_bayes    import GaussianNB
+from sklearn.neighbors      import KNeighborsClassifier
+from sklearn.tree           import DecisionTreeClassifier
+from sklearn.ensemble       import (RandomForestClassifier,
+                                    HistGradientBoostingClassifier)
+from sklearn.svm            import SVC
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics        import roc_auc_score
 
@@ -60,13 +60,11 @@ warnings.filterwarnings("ignore")
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def _scale(X_train, X_test):
-    """StandardScaler fit on train, applied to both."""
     sc = StandardScaler()
     return sc.fit_transform(X_train), sc.transform(X_test)
 
 
 def _sksurv_y(events, times):
-    """Build scikit-survival structured array target."""
     return np.array(
         [(bool(e), float(t)) for e, t in zip(events, times)],
         dtype=[('event', bool), ('time', float)]
@@ -141,7 +139,7 @@ def run_binary_baselines(X_train, y_train, X_test, y_test):
 # ─────────────────────────────────────────────────────────────────────────────
 def run_survival_baselines(X_train, times_train, events_train,
                            X_test,  times_test,  events_test):
-    """Fit 6 survival models, evaluate Harrell C-index on test set."""
+    """Fit survival models, evaluate Harrell C-index on test set."""
     X_tr_sc, X_te_sc = _scale(X_train, X_test)
     results = []
 
@@ -154,7 +152,7 @@ def run_survival_baselines(X_train, times_train, events_train,
         from lifelines import CoxPHFitter
         import pandas as pd
 
-        cols = [f"f{i}" for i in range(X_tr_sc.shape[1])]
+        cols  = [f"f{i}" for i in range(X_tr_sc.shape[1])]
         df_tr = pd.DataFrame(X_tr_sc, columns=cols)
         df_tr['time']  = times_train
         df_tr['event'] = events_train.astype(int)
@@ -174,7 +172,7 @@ def run_survival_baselines(X_train, times_train, events_train,
         from lifelines import CoxPHFitter
         import pandas as pd
 
-        cols = [f"f{i}" for i in range(X_tr_sc.shape[1])]
+        cols  = [f"f{i}" for i in range(X_tr_sc.shape[1])]
         df_tr = pd.DataFrame(X_tr_sc, columns=cols)
         df_tr['time']  = times_train
         df_tr['event'] = events_train.astype(int)
@@ -193,12 +191,9 @@ def run_survival_baselines(X_train, times_train, events_train,
     try:
         from sksurv.ensemble import RandomSurvivalForest
 
-        y_tr = _sksurv_y(events_train, times_train)
-        y_te = _sksurv_y(events_test,  times_test)
-
         rsf = RandomSurvivalForest(n_estimators=500, max_features='sqrt',
                                    random_state=RANDOM_STATE, n_jobs=-1)
-        rsf.fit(X_train, y_tr)
+        rsf.fit(X_train, _sksurv_y(events_train, times_train))
         risk = rsf.predict(X_test)
         ci   = concordance_index(risk, times_test, events_test)
         results.append({"name": "Random Survival Forest", "cindex": ci})
@@ -210,11 +205,10 @@ def run_survival_baselines(X_train, times_train, events_train,
     try:
         from sksurv.ensemble import GradientBoostingSurvivalAnalysis
 
-        y_tr = _sksurv_y(events_train, times_train)
         gbsa = GradientBoostingSurvivalAnalysis(
             n_estimators=200, learning_rate=0.05,
             max_depth=3, random_state=RANDOM_STATE)
-        gbsa.fit(X_train, y_tr)
+        gbsa.fit(X_train, _sksurv_y(events_train, times_train))
         risk = gbsa.predict(X_test)
         ci   = concordance_index(risk, times_test, events_test)
         results.append({"name": "GB Survival", "cindex": ci})
@@ -227,17 +221,15 @@ def run_survival_baselines(X_train, times_train, events_train,
         import torchtuples as tt
         from pycox.models import CoxPH as PyCoxCoxPH
 
-        Xtr_f = X_tr_sc.astype(np.float32)
-        Xte_f = X_te_sc.astype(np.float32)
+        Xtr_f   = X_tr_sc.astype(np.float32)
+        Xte_f   = X_te_sc.astype(np.float32)
         y_ds_tr = (times_train.astype(np.float32),
                    events_train.astype(np.float32))
 
-        net_ds = tt.practical.MLPVanilla(
-            Xtr_f.shape[1], [64, 64], 1,
-            batch_norm=True, dropout=0.3)
+        net_ds   = tt.practical.MLPVanilla(
+            Xtr_f.shape[1], [64, 64], 1, batch_norm=True, dropout=0.3)
         model_ds = PyCoxCoxPH(net_ds, tt.optim.Adam(0.001))
-        model_ds.fit(Xtr_f, y_ds_tr,
-                     batch_size=64, epochs=100,
+        model_ds.fit(Xtr_f, y_ds_tr, batch_size=64, epochs=100,
                      callbacks=[tt.callbacks.EarlyStopping(patience=15)],
                      verbose=False)
 
@@ -259,24 +251,32 @@ def run_survival_baselines(X_train, times_train, events_train,
             times_train.astype(np.float32),
             events_train.astype(np.float32))
 
-        Xtr_f = X_tr_sc.astype(np.float32)
-        Xte_f = X_te_sc.astype(np.float32)
+        Xtr_f   = X_tr_sc.astype(np.float32)
+        Xte_f   = X_te_sc.astype(np.float32)
 
-        net_dh = tt.practical.MLPVanilla(
+        net_dh   = tt.practical.MLPVanilla(
             Xtr_f.shape[1], [64, 64], labtrans.out_features,
             batch_norm=True, dropout=0.3)
         model_dh = DeepHitSingle(net_dh, tt.optim.Adam(0.001),
                                  alpha=0.2, sigma=0.1,
                                  duration_index=labtrans.cuts)
-        model_dh.fit(Xtr_f, y_dh_tr,
-                     batch_size=64, epochs=100,
+        model_dh.fit(Xtr_f, y_dh_tr, batch_size=64, epochs=100,
                      callbacks=[tt.callbacks.EarlyStopping(patience=15)],
                      verbose=False)
 
+        # predict_surv_df returns (time_cuts × patients).
+        # For each patient, find the first time point where survival ≤ 0.5
+        # (median survival time) using integer position to avoid index type errors.
         surv = model_dh.predict_surv_df(Xte_f)
-        risk = -surv.index[surv.apply(
-            lambda col: (col <= 0.5).idxmax()
-        )].values
+        def _median_surv(col):
+            below = (col <= 0.5).values
+            pos   = below.argmax()            # integer position of first True
+            if not below.any():
+                return col.index[-1]          # never drops below 0.5
+            return col.index[pos]             # actual time value at that position
+
+        median_times = surv.apply(_median_surv).values
+        risk = -median_times                  # longer predicted survival = lower risk
         ci   = concordance_index(risk, times_test, events_test)
         results.append({"name": "DeepHit", "cindex": ci})
         print(f"  {'DeepHit':<35} {ci:>9.4f}")
@@ -290,8 +290,8 @@ def run_survival_baselines(X_train, times_train, events_train,
 # PLOTS
 # ─────────────────────────────────────────────────────────────────────────────
 def _plot_survival_bars(surv_results, gcn_cindex, output_dir, title_suffix=""):
-    names = [r["name"] for r in surv_results] + ["GCN-Cox (ours)"]
-    cis   = [r["cindex"] for r in surv_results] + [gcn_cindex]
+    names   = [r["name"] for r in surv_results] + ["GCN-Cox (ours)"]
+    cis     = [r["cindex"] for r in surv_results] + [gcn_cindex]
     order   = np.argsort(cis)
     names_s = [names[i] for i in order]
     cis_s   = [cis[i]   for i in order]
@@ -300,17 +300,20 @@ def _plot_survival_bars(surv_results, gcn_cindex, output_dir, title_suffix=""):
     fig, ax = plt.subplots(figsize=(9, 5))
     bars = ax.barh(names_s, cis_s, color=colors, edgecolor='white', height=0.6)
     for bar, val in zip(bars, cis_s):
-        ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
+        ax.text(bar.get_width() + 0.005,
+                bar.get_y() + bar.get_height() / 2,
                 f"{val:.3f}", va='center', ha='left', fontsize=10)
 
     ax.axvline(0.5, linestyle='--', color='red', linewidth=1.2,
                alpha=0.7, label='Random (0.50)')
     ax.set_xlabel("Harrell's C-index", fontsize=12)
-    ax.set_title(f"GBM Survival Prediction\nC-index Comparison"
-                 f"{' — ' + title_suffix if title_suffix else ''}",
-                 fontsize=14)
+    ax.set_title(
+        f"GBM Survival Prediction\nC-index Comparison"
+        f"{' — ' + title_suffix if title_suffix else ''}",
+        fontsize=14)
     ax.set_xlim(0.3, min(1.0, max(cis_s) + 0.08))
-    ax.legend(fontsize=10);  ax.grid(axis='x', alpha=0.3)
+    ax.legend(fontsize=10)
+    ax.grid(axis='x', alpha=0.3)
 
     path = f"{output_dir}/baseline_survival_cindex.png"
     plt.tight_layout()
@@ -354,12 +357,15 @@ def run_baseline_comparison(pipeline: dict, gcn_results: dict,
     """
     Run all baseline comparisons and generate plots.
 
+    y_train / y_test in pipeline are LTS labels derived inline in main.py
+    as (OS_MONTHS > threshold).astype(int) — no stored LTS column needed.
+
     Parameters
     ----------
     pipeline     : dict returned by main.main()
     gcn_results  : dict returned by train_gcn()
     output_dir   : directory to save plots
-    title_suffix : optional string added to plot titles (e.g. 'LTS=12m')
+    title_suffix : appended to plot titles (e.g. 'LTS=12m')
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -384,9 +390,9 @@ def run_baseline_comparison(pipeline: dict, gcn_results: dict,
     print(f"  LTS train={int(y_train.sum())} | LTS test={int(y_test.sum())}")
     print("=" * 62)
 
-    gcn_auc    = gcn_results["auc"]
-    gcn_probs  = gcn_results["probs"]
-    gcn_ytrue  = gcn_results["y_true"]
+    gcn_auc    = gcn_results["threshold_sensitivity"][12] 
+    gcn_probs  = gcn_results["pred_months"]
+    gcn_ytrue  = y_test
     gcn_cindex = gcn_results["cindex"]
 
     binary_results = run_binary_baselines(X_train, y_train, X_test, y_test)
@@ -396,8 +402,6 @@ def run_baseline_comparison(pipeline: dict, gcn_results: dict,
     _print_binary_summary(binary_results, gcn_auc)
     _print_survival_summary(surv_results, gcn_cindex)
 
-    # ── ROC plot — baselines + GCN as last entry (black) ─────────────────────
-    # Rename 'name' → 'label' for plot_roc_curves compatibility, then append GCN
     roc_entries = [{"label": r["name"], "probs": r["probs"],
                     "y_true": r["y_true"], "auc": r["auc"]}
                    for r in binary_results]

@@ -3,11 +3,24 @@ gcn_model.py
 ------------
 Graph Convolutional Network with dual prediction heads:
 
-  1. Binary head  → LTS / non-LTS classification (cross-entropy loss)
-  2. Cox head     → continuous risk score for time-to-event survival
-                    modelling (Cox partial likelihood loss)
+  1. AFT regression head → predicted log-survival time (location of a
+                          log-normal AFT model: log(T) ~ Normal(mu, sigma^2))
+  2. Cox head            → continuous risk score for time-to-event survival
+                          modelling (Cox partial likelihood loss)
 
 Both heads share the same GCN backbone (two graph conv layers).
+
+AFT head detail
+----------------
+fc_reg outputs mu(x) = log(t-hat), the per-patient LOCATION of the assumed
+log-normal distribution. The SCALE sigma is NOT predicted per patient —
+it's a single GLOBAL scalar (self.log_sigma), shared across every patient,
+learned jointly with the rest of the network via backprop on the AFT
+negative log-likelihood (see src/utils.py: aft_loss). This is the standard
+parametric-AFT convention (one scale per model, not per observation) and
+is the appropriate choice given the cohort size here (~200 patients) —
+a per-patient scale head would meaningfully increase overfitting risk
+without much benefit at this N.
 
 Optional per-modality encoders (Issue 5 response):
   When modality_dims is provided (e.g. [50, 50, 50, 4] for CNA/mRNA/meth/clin),
@@ -72,29 +85,29 @@ class GraphConvolution(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 class GCN(nn.Module):
     """
-    Two-layer GCN with optional per-modality encoders, a binary
-    classification head, and a Cox survival head.
+    Two-layer GCN with optional per-modality encoders, a log-normal AFT
+    regression head (learned global scale), and a Cox survival head.
 
-    Architecture (with modality encoders — ablation A8 / full model):
+    Architecture (with modality encoders — full model):
         CNA  (50) ──► Linear(50→enc_dim) + ELU ──┐
         mRNA (50) ──► Linear(50→enc_dim) + ELU ──┼── cat → GraphConv → GraphConv
         Meth (50) ──► Linear(50→enc_dim) + ELU ──┤                         │
         Clin  (4) ──► Linear( 4→enc_dim) + ELU ──┘                    embeddings H
-                                                                        /          \
-                                                             fc_bin (binary)   fc_cox (risk)
+                                                                        /             \
+                                                             fc_reg (mu=log t̂)   fc_cox (risk)
+                                                             [+ global log_sigma, not from H]
 
     Architecture (without encoders — ablation A7, plain concatenation):
-        [CNA ∥ mRNA ∥ Meth ∥ Clin] (154-dim) → GraphConv → GraphConv
+        [CNA ∥ mRNA ∥ Meth ∥ Clin] (raw-dim) → GraphConv → GraphConv
                                                                    │
                                                               embeddings H
-                                                              /          \
-                                                   fc_bin (binary)   fc_cox (risk)
+                                                              /             \
+                                                   fc_reg (mu=log t̂)   fc_cox (risk)
 
     Parameters
     ----------
-    n_in         : int        Total raw input feature dimension (154).
-    n_hid        : int        Hidden dimension of GCN layers (64).
-    n_out        : int        Number of binary output classes (2).
+    n_in         : int        Total raw input feature dimension.
+    n_hid        : int        Hidden dimension of GCN layers.
     dropout      : float      Dropout rate after each GCN layer.
     modality_dims: list[int]  Feature dimension of each modality block in
                               the order they appear in the feature matrix,
@@ -105,7 +118,7 @@ class GCN(nn.Module):
                               GCN input = enc_dim × len(modality_dims).
     """
 
-    def __init__(self, n_in: int, n_hid: int, n_out: int,
+    def __init__(self, n_in: int, n_hid: int,
                  dropout: float = 0.5,
                  modality_dims: list = None,
                  enc_dim: int = 32):
@@ -134,9 +147,26 @@ class GCN(nn.Module):
         self.gc2     = GraphConvolution(n_hid,  n_hid)
         self.dp1     = nn.Dropout(dropout)
         self.dp2     = nn.Dropout(dropout)
-        self.fc_bin  = nn.Linear(n_hid, n_out)
+
+        # AFT regression head: outputs mu(x) = log(t-hat), the LOCATION
+        # of the log-normal AFT distribution for each patient.
+        self.fc_reg  = nn.Linear(n_hid, 1)
+        # Cox head: predicts log-hazard (risk score)
         self.fc_cox  = nn.Linear(n_hid, 1)
+
+        # Global AFT scale parameter (log-normal AFT): log(T) ~ Normal(mu, sigma^2).
+        # A SINGLE scalar shared across all patients — not predicted from H,
+        # not a function of x at all — learned jointly with the rest of the
+        # network via backprop on the AFT negative log-likelihood.
+        # Initialised so sigma starts at exp(0) = 1.0, matching the old
+        # fixed-variance baseline as a sensible warm start.
+        self.log_sigma = nn.Parameter(torch.tensor(0.0))
+
         self.dropout = dropout
+
+    def sigma(self) -> torch.Tensor:
+        """Current learned global AFT scale parameter (always > 0)."""
+        return torch.exp(self.log_sigma)
 
     def forward(self, x: torch.Tensor,
                 adj: torch.Tensor) -> tuple:
@@ -148,7 +178,9 @@ class GCN(nn.Module):
 
         Returns
         -------
-        bin_logits  : (N, 2)     raw logits for binary head
+        pred_log_t  : (N,)       predicted location mu(x) = log(t-hat);
+                                  exp() gives months. Scale sigma is a
+                                  separate global parameter — see self.sigma().
         cox_risk    : (N,)       scalar risk scores (higher = more risk)
         embeddings  : (N, n_hid) shared GCN node embeddings
         """
@@ -170,12 +202,13 @@ class GCN(nn.Module):
         h = self.dp2(h)
 
         # ── Dual prediction heads ─────────────────────────────────────────────
-        bin_logits = self.fc_bin(h)              # (N, 2)
-        cox_risk   = self.fc_cox(h).squeeze(-1)  # (N,)
+        pred_log_t = self.fc_reg(h).squeeze(-1)   # (N,) mu(x) = log(t-hat)
+        cox_risk   = self.fc_cox(h).squeeze(-1)   # (N,) log-hazard risk score
 
-        return bin_logits, cox_risk, h
+        return pred_log_t, cox_risk, h
 
     def __repr__(self):
+        sigma_val = float(torch.exp(self.log_sigma).item())
         if self.mod_encoders is not None:
             enc_str = (f"ModalityEncoders({self.modality_dims}→{self.enc_dim}each)"
                        f" → GCN({self.enc_dim*len(self.modality_dims)}"
@@ -184,5 +217,5 @@ class GCN(nn.Module):
             enc_str = (f"GCN({self.gc1.in_features}"
                        f"→{self.gc1.out_features}→{self.gc2.out_features})")
         return (f"GCN({enc_str}, "
-                f"BinaryHead→{self.fc_bin.out_features}, "
-                f"CoxHead→1, dropout={self.dropout})")
+                f"AFTHead→mu=log(t̂) [global σ={sigma_val:.3f}], "
+                f"CoxHead→risk, dropout={self.dropout})")

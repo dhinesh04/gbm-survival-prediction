@@ -10,18 +10,21 @@ Functions
 ---------
   concordance_index()            — Harrell C-index (numpy, no torch)
   cox_partial_likelihood_loss()  — Cox partial likelihood (torch)
+  aft_loss()                     — log-normal AFT negative log-likelihood (torch)
   normalise_adjacency()          — D^-0.5 A D^-0.5 normalisation
   attach_test_nodes()            — k-NN attach test patients to PSN
-  find_best_threshold()          — macro-F1 threshold sweep
-  compute_class_weights()        — inverse-frequency class weights
+  find_best_threshold()          — macro-F1 threshold sweep (legacy, binary-head era)
+  compute_class_weights()        — inverse-frequency class weights (legacy, binary-head era)
   significance_stars()           — p-value → *** / ** / * / n.s.
-  plot_roc_curves()              — smooth interpolated ROC figure
+  plot_roc_curves()              — smooth interpolated ROC figure (legacy, binary-head era)
 """
 
 import os
+import math
 import numpy as np
 import torch
 import matplotlib
+import itertools
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, roc_curve
@@ -106,6 +109,75 @@ def cox_partial_likelihood_loss(risk_scores: torch.Tensor,
     return -(risk_scores - log_cumsum)[events == 1].mean()
 
 
+def aft_loss(pred_log_t: torch.Tensor,
+             times: torch.Tensor,
+             events: torch.Tensor,
+             log_sigma: torch.Tensor) -> torch.Tensor:
+    """
+    Log-normal AFT negative log-likelihood, in log-time space.
+
+    Model:  log(T) ~ Normal(mu(x), sigma^2)
+        mu(x) = pred_log_t   — per-patient location, output by the network
+        sigma = exp(log_sigma) — a single GLOBAL scale parameter, shared
+                across all patients, learned jointly with the network
+                (NOT predicted per patient — see gcn_model.py).
+
+    For uncensored patients (event = 1), the per-patient term is the
+    negative log-density of Normal(mu, sigma^2) evaluated at the observed
+    log(t):
+        NLL_i = log(sigma) + 0.5*log(2*pi) + (log(t_i) - mu_i)^2 / (2*sigma^2)
+
+    For censored patients (event = 0), the per-patient term is the
+    negative log of the survival function S(t_obs) = P(T > t_obs):
+        z_i   = (mu_i - log(t_obs_i)) / sigma
+        NLL_i = -log(Phi(z_i))
+    where Phi is the standard normal CDF (computed via torch.erf). As mu_i
+    grows relative to log(t_obs_i), Phi(z_i) -> 1 and the penalty vanishes
+    (consistent with what's known about the censored patient — they were
+    alive at least until t_obs). As mu_i shrinks below log(t_obs_i),
+    Phi(z_i) -> 0 and the penalty grows without bound (the model is
+    claiming the patient died before they're known to have been alive).
+
+    Note: the Jacobian term from converting the density of log(T) to the
+    density of T itself (a function of t alone) is omitted. It's constant
+    with respect to (mu, sigma), so dropping it changes the absolute loss
+    value by a constant offset but does not change the gradient or the
+    optimal (mu, sigma) — standard practice when treating log(T) directly
+    as the regression target.
+
+    This replaces the earlier fixed-variance squared-error approximation
+    (which is the sigma=1, no-censoring-likelihood special case of this
+    loss). Learning sigma lets the model express how much spread genuinely
+    exists in survival times, rather than assuming a fixed amount.
+
+    Parameters
+    ----------
+    pred_log_t : (N,) predicted location mu(x) = log(t-hat)
+    times      : (N,) observed survival / censoring times in months
+    events     : (N,) 1 = deceased (uncensored), 0 = censored
+    log_sigma  : scalar torch tensor — the model's learnable log(sigma)
+
+    Returns
+    -------
+    Scalar differentiable tensor (mean NLL over patients).
+    """
+    sigma = torch.exp(log_sigma).clamp(min=1e-3)
+    log_t = torch.log(times.clamp(min=1e-8))
+
+    # Uncensored: negative log-density of Normal(mu, sigma^2) at log_t
+    resid          = log_t - pred_log_t
+    nll_uncensored = log_sigma + 0.5 * math.log(2 * math.pi) + (resid ** 2) / (2 * sigma ** 2)
+
+    # Censored: negative log-survival, S(t_obs) = Phi((mu - log_t) / sigma)
+    z            = (pred_log_t - log_t) / sigma
+    phi_z        = 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+    phi_z        = phi_z.clamp(min=1e-7)          # avoid log(0)
+    nll_censored = -torch.log(phi_z)
+
+    per_patient = torch.where(events == 1, nll_uncensored, nll_censored)
+    return per_patient.mean()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GRAPH UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,7 +250,8 @@ def attach_test_nodes(psn_train: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLASSIFICATION UTILITIES
+# CLASSIFICATION UTILITIES (legacy — binary-head era, retained for
+# ablation_studies.py / baseline_comparison.py pending their own update)
 # ─────────────────────────────────────────────────────────────────────────────
 def find_best_threshold(probs: np.ndarray,
                         y_true: np.ndarray) -> float:
@@ -275,7 +348,8 @@ def plot_roc_curves(results: list,
     results     : list of dicts (one per model/configuration)
     output_path : full path to save the PNG (directory must exist)
     title       : figure title string
-    colors      : optional list of hex color strings (one per result)
+    colors      : optional list of hex color strings. If fewer entries than
+                  results, the list is cycled so no curve is ever dropped.
 
     Returns
     -------
@@ -284,15 +358,16 @@ def plot_roc_curves(results: list,
     default_colors = [
         "#ff0000", "#00aa22", "#2244ff", "#ff9900",
         "#f2b6c6", "#66d9ff", "#aa00aa", "#bfef45",
-        "#000000",
+        "#000000", "#8B4513", "#e6194b", "#4363d8",
     ]
-    colors = colors or default_colors
+    # Cycle so any number of results is handled without silent truncation
+    color_cycle = itertools.cycle(colors if colors else default_colors)
 
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.plot([0, 1], [0, 1], linestyle="--", color="navy",
             linewidth=1.5, alpha=0.8, label="Random  0.50")
 
-    for res, color in zip(results, colors):
+    for res, color in zip(results, color_cycle):
         label = res.get("label") or res.get("name", "?")
         fpr, tpr, _ = roc_curve(res["y_true"], res["probs"])
 

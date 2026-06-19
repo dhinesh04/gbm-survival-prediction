@@ -19,6 +19,9 @@ DEFAULT_PLOTS_DIR = "plots"
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. LTS THRESHOLD EXPERIMENT
 # ─────────────────────────────────────────────────────────────────────────────
+# Retained only because data_processing.py / older modules may still
+# reference it. gcn_train.py no longer uses any threshold anywhere —
+# CV stratification is done on event status (deceased vs censored).
 LTS_THRESHOLDS    = [12, 18, 24]
 DEFAULT_THRESHOLD = 24
 
@@ -30,7 +33,7 @@ TEST_SIZE      = 0.30
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. mRMR FEATURE SELECTION
 # ─────────────────────────────────────────────────────────────────────────────
-K_MRMR         = 50
+K_MRMR         = 100
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. SNF — PATIENT SIMILARITY NETWORK
@@ -80,5 +83,24 @@ K_TEST         = 10
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. JOINT LOSS WEIGHTS
 # ─────────────────────────────────────────────────────────────────────────────
-ALPHA_BIN      = 0.5
+# ALPHA_AFT / ALPHA_COX below are the legacy fixed defaults. They are kept
+# for backward compatibility with modules not yet updated to the grid search
+# (ablation_studies.py, baseline_comparison.py — pending update).
+#
+# gcn_train.py IGNORES these two and instead performs a nested 5-fold CV
+# grid search over ALPHA_AFT_GRID × ALPHA_COX_GRID, selecting the winning
+# pair via SELECTION_METRIC, then uses that pair for the final retrain.
+ALPHA_AFT      = 0.5
 ALPHA_COX      = 2.0
+
+# Candidate values searched via nested 5-fold CV in gcn_train.py.
+# 4 x 4 = 16 combinations x 5 folds = 80 fold-trainings, plus 1 final retrain.
+# Shrink these lists first if a faster turnaround is needed.
+ALPHA_AFT_GRID = [0.25, 0.5, 1.0, 2.0]
+ALPHA_COX_GRID = [0.5, 1.0, 2.0, 4.0]
+
+# Which CV metric selects the winning (alpha_aft, alpha_cox) pair.
+#   "mae"    — lowest mean CV validation MAE (months). The AFT head's own
+#              native metric — recommended default.
+#   "cindex" — highest mean CV validation Cox C-index.
+SELECTION_METRIC = "mae"
