@@ -1,15 +1,8 @@
-"""
-mrmr.py
--------
-Supervised feature selection using Minimum Redundancy Maximum Relevance (mRMR).
-
-Fitted on training data only — test data is transformed using the features
-selected from training, never used to influence selection.
-"""
+"""mRMR (Minimum Redundancy Maximum Relevance) feature selection, fit on train only."""
 
 import numpy as np
 import pandas as pd
-from mrmr import mrmr_classif
+from mrmr import mrmr_regression
 
 
 def select_features_mrmr(
@@ -17,49 +10,29 @@ def select_features_mrmr(
     y_train: pd.Series,
     X_test: pd.DataFrame,
     K: int = 50,
-    modality_name: str = ""
+    modality_name: str = "",
+    relevance_mask: np.ndarray = None,
 ) -> tuple[np.ndarray, np.ndarray, list]:
+    """Select K mRMR features against a continuous survival-time target, fit on train only.
+
+    relevance_mask (optional): fit relevance/redundancy only on these rows
+    (e.g. deceased patients with exact times), but still apply the selected
+    columns to every row of X_train/X_test.
     """
-    Apply mRMR feature selection fitted on training data only.
-
-    mRMR selects K features that maximise mutual information with the
-    survival label (LTS/non-LTS) while minimising redundancy among
-    selected features. This is fundamentally different from variance
-    filtering, which is blind to the survival label entirely.
-
-    Parameters
-    ----------
-    X_train : pd.DataFrame, shape (n_train, n_features)
-        Training omics matrix. Rows = patients, columns = features.
-    y_train : pd.Series, shape (n_train,)
-        Binary LTS label for training patients (1=LTS, 0=non-LTS).
-    X_test : pd.DataFrame, shape (n_test, n_features)
-        Test omics matrix. Same columns as X_train.
-        Transformed using features selected from training — never fitted.
-    K : int
-        Number of features to select. Default 50.
-    modality_name : str
-        Name for logging (e.g. 'CNA', 'mRNA', 'Methylation').
-
-    Returns
-    -------
-    X_train_sel : np.ndarray, shape (n_train, K)
-        Training data reduced to K selected features.
-    X_test_sel : np.ndarray, shape (n_test, K)
-        Test data reduced to the same K features.
-    selected_features : list
-        Column names of the K selected features.
-    """
-    # Ensure clean indices to avoid alignment issues
     X_train = X_train.reset_index(drop=True)
     X_test  = X_test.reset_index(drop=True)
     y_train = pd.Series(y_train.values if hasattr(y_train, 'values') else y_train)
 
-    print(f"  [{modality_name}] mRMR: {X_train.shape[1]:,} features → selecting {K}")
+    if relevance_mask is not None:
+        X_fit = X_train[relevance_mask].reset_index(drop=True)
+        y_fit = y_train[relevance_mask].reset_index(drop=True)
+    else:
+        X_fit, y_fit = X_train, y_train
 
-    # mRMR is fit on training data only
-    # Returns an ordered list of K feature names (most relevant first)
-    selected_features = mrmr_classif(X=X_train, y=y_train, K=K)
+    print(f"  [{modality_name}] mRMR: {X_train.shape[1]:,} features → selecting {K} "
+          f"(relevance fit on {len(X_fit)}/{len(X_train)} patients)")
+
+    selected_features = mrmr_regression(X=X_fit, y=y_fit, K=K)
 
     X_train_sel = X_train[selected_features].values.astype(np.float32)
     X_test_sel  = X_test[selected_features].values.astype(np.float32)
@@ -78,35 +51,22 @@ def run_mrmr_all_modalities(
     X_mrna_test:   pd.DataFrame,
     X_meth_test:   pd.DataFrame,
     K: int = 50,
-    # Optional 4th modality — mutation binary matrix
     X_mut_train:   pd.DataFrame = None,
     X_mut_test:    pd.DataFrame = None,
+    relevance_mask: np.ndarray = None,
 ) -> dict:
-    """
-    Run mRMR independently on each omics modality.
-    If X_mut_train / X_mut_test are provided, mutation is included as a
-    4th modality with its own K selected features.
-
-    Selection is always fit on training data only.
-
-    Returns
-    -------
-    dict with keys:
-        'cna_train',  'cna_test',  'cna_features'
-        'mrna_train', 'mrna_test', 'mrna_features'
-        'meth_train', 'meth_test', 'meth_features'
-        'mut_train',  'mut_test',  'mut_features'   ← only if mutation provided
-    """
+    """Run mRMR independently per omics modality; mutation is included as a 4th
+    modality only if X_mut_train/X_mut_test are given."""
     print("\n── mRMR Feature Selection ──────────────────────────────────")
 
     cna_tr, cna_te, cna_feats = select_features_mrmr(
-        X_cna_train, y_train, X_cna_test, K=K, modality_name="CNA"
+        X_cna_train, y_train, X_cna_test, K=K, modality_name="CNA", relevance_mask=relevance_mask
     )
     mrna_tr, mrna_te, mrna_feats = select_features_mrmr(
-        X_mrna_train, y_train, X_mrna_test, K=K, modality_name="mRNA"
+        X_mrna_train, y_train, X_mrna_test, K=K, modality_name="mRNA", relevance_mask=relevance_mask
     )
     meth_tr, meth_te, meth_feats = select_features_mrmr(
-        X_meth_train, y_train, X_meth_test, K=K, modality_name="Methylation"
+        X_meth_train, y_train, X_meth_test, K=K, modality_name="Methylation", relevance_mask=relevance_mask
     )
 
     n_modalities = 3
@@ -118,7 +78,7 @@ def run_mrmr_all_modalities(
 
     if X_mut_train is not None and X_mut_test is not None:
         mut_tr, mut_te, mut_feats = select_features_mrmr(
-            X_mut_train, y_train, X_mut_test, K=K, modality_name="Mutation"
+            X_mut_train, y_train, X_mut_test, K=K, modality_name="Mutation", relevance_mask=relevance_mask
         )
         result["mut_train"]    = mut_tr
         result["mut_test"]     = mut_te

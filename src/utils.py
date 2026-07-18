@@ -1,54 +1,21 @@
-"""
-utils.py
---------
-Shared utility functions used across the pipeline.
-
-Imported by: gcn_train.py, ablation_studies.py,
-             baseline_comparison.py, km_plot.py
-
-Functions
----------
-  concordance_index()            — Harrell C-index (numpy, no torch)
-  cox_partial_likelihood_loss()  — Cox partial likelihood (torch)
-  normalise_adjacency()          — D^-0.5 A D^-0.5 normalisation
-  attach_test_nodes()            — k-NN attach test patients to PSN
-  find_best_threshold()          — macro-F1 threshold sweep
-  compute_class_weights()        — inverse-frequency class weights
-  significance_stars()           — p-value → *** / ** / * / n.s.
-  plot_roc_curves()              — smooth interpolated ROC figure
-"""
+"""Shared utility functions used across the pipeline."""
 
 import os
+import math
 import numpy as np
 import torch
 import matplotlib
+import itertools
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, roc_curve
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SURVIVAL METRICS
-# ─────────────────────────────────────────────────────────────────────────────
 def concordance_index(risk_scores: np.ndarray,
                       times: np.ndarray,
                       events: np.ndarray) -> float:
-    """
-    Harrell's C-index.
-
-    Counts concordant comparable pairs where the patient who died sooner
-    has the higher predicted risk score.
-
-    Parameters
-    ----------
-    risk_scores : (N,) predicted risk (higher = more risk)
-    times       : (N,) survival times in months
-    events      : (N,) 1 = event observed, 0 = censored
-
-    Returns
-    -------
-    float in [0, 1]. Returns 0.5 (random) if no comparable pairs exist.
-    """
+    """Harrell's C-index: fraction of comparable pairs where the patient who
+    died sooner has the higher risk score. Returns 0.5 if no pairs are comparable."""
     n = len(times)
     concordant = comparable = 0
     for i in range(n):
@@ -79,23 +46,8 @@ def concordance_index(risk_scores: np.ndarray,
 def cox_partial_likelihood_loss(risk_scores: torch.Tensor,
                                 times: torch.Tensor,
                                 events: torch.Tensor) -> torch.Tensor:
-    """
-    Breslow approximation of the Cox partial likelihood loss.
-
-    Patients are sorted by descending survival time. For each observed
-    event, the loss penalises the model if the event patient does not have
-    a higher risk score than the other patients still at risk.
-
-    Parameters
-    ----------
-    risk_scores : (N,) torch float — predicted log-hazard
-    times       : (N,) torch float — survival times
-    events      : (N,) torch float — 1 = event observed, 0 = censored
-
-    Returns
-    -------
-    Scalar torch tensor (differentiable).
-    """
+    """Breslow approximation of the Cox partial likelihood loss: penalises
+    an event patient for not outscoring the others still at risk."""
     sort_idx    = torch.argsort(times, descending=True)
     risk_scores = risk_scores[sort_idx]
     events      = events[sort_idx]
@@ -106,26 +58,38 @@ def cox_partial_likelihood_loss(risk_scores: torch.Tensor,
     return -(risk_scores - log_cumsum)[events == 1].mean()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GRAPH UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
+def aft_loss(pred_log_t: torch.Tensor,
+             times: torch.Tensor,
+             events: torch.Tensor,
+             log_sigma: torch.Tensor) -> torch.Tensor:
+    """Log-normal AFT negative log-likelihood: log(T) ~ Normal(mu, sigma^2),
+    where mu = pred_log_t (per patient) and sigma = exp(log_sigma) is a single
+    global scale learned jointly with the network (see gcn_model.py).
+
+    Uncensored patients get the Normal log-density at log(t). Censored
+    patients get -log(S(t_obs)) = -log(Phi((mu - log_t)/sigma)), so the
+    penalty vanishes as mu grows past log(t_obs) and blows up as it falls
+    below it. Drops the log(T)->T Jacobian term since it's constant w.r.t.
+    (mu, sigma) and doesn't affect the gradient or optimum.
+    """
+    sigma = torch.exp(log_sigma).clamp(min=1e-3)
+    log_t = torch.log(times.clamp(min=1e-8))
+
+    resid          = log_t - pred_log_t
+    nll_uncensored = log_sigma + 0.5 * math.log(2 * math.pi) + (resid ** 2) / (2 * sigma ** 2)
+
+    z            = (pred_log_t - log_t) / sigma
+    phi_z        = 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+    phi_z        = phi_z.clamp(min=1e-7)          # avoid log(0)
+    nll_censored = -torch.log(phi_z)
+
+    per_patient = torch.where(events == 1, nll_uncensored, nll_censored)
+    return per_patient.mean()
+
+
 def normalise_adjacency(psn: np.ndarray,
                         threshold: float = 0.0) -> torch.Tensor:
-    """
-    Symmetric normalisation: A_norm = D^-0.5 * (A + I) * D^-0.5
-
-    Edges below `threshold` are zeroed before normalisation.
-    Self-loops are added via identity matrix.
-
-    Parameters
-    ----------
-    psn       : (N, N) raw affinity matrix
-    threshold : edges below this value are set to 0
-
-    Returns
-    -------
-    torch.FloatTensor (N, N)
-    """
+    """Symmetric normalisation A_norm = D^-0.5 (A + I) D^-0.5, zeroing edges below threshold first."""
     A = psn.copy()
     np.fill_diagonal(A, 0)
     A[A < threshold] = 0
@@ -139,24 +103,9 @@ def attach_test_nodes(psn_train: np.ndarray,
                       X_train: np.ndarray,
                       X_test: np.ndarray,
                       k: int = 10) -> np.ndarray:
-    """
-    Attach test patients to the training PSN via k-NN cosine similarity.
-
-    Test nodes are connected to their k most similar training patients.
-    The resulting (n_train + n_test) × (n_train + n_test) adjacency
-    matrix preserves the original training PSN in the top-left block.
-
-    Parameters
-    ----------
-    psn_train : (n_train, n_train) training PSN
-    X_train   : (n_train, F) training feature matrix
-    X_test    : (n_test,  F) test feature matrix
-    k         : number of training neighbours per test node
-
-    Returns
-    -------
-    full_adj : (n_train + n_test, n_train + n_test) numpy array
-    """
+    """Attach test patients to the training PSN via k-NN cosine similarity,
+    connecting each test node to its k most similar training patients.
+    The original training PSN is preserved in the top-left block of the result."""
     n_train = X_train.shape[0]
     n_test  = X_test.shape[0]
     n_total = n_train + n_test
@@ -177,29 +126,12 @@ def attach_test_nodes(psn_train: np.ndarray,
     return full_adj
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLASSIFICATION UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
+# legacy binary-head era, kept for ablation_studies.py / baseline_comparison.py
 def find_best_threshold(probs: np.ndarray,
                         y_true: np.ndarray) -> float:
-    """
-    Sweep decision thresholds from 0.20 to 0.75 and return the value
-    that maximises macro-F1 on the given predictions.
-
-    Macro-F1 weights both classes equally, so the threshold is pushed
-    toward balanced recall across LTS / non-LTS even under class imbalance.
-    The conservative range (0.20–0.75) prevents extreme thresholds on
-    small validation folds where a single patient flip dominates the metric.
-
-    Parameters
-    ----------
-    probs  : (N,) predicted probabilities for the positive class
-    y_true : (N,) ground-truth binary labels
-
-    Returns
-    -------
-    float — best threshold in [0.20, 0.75]
-    """
+    """Sweep thresholds in [0.20, 0.75] and return the one maximising macro-F1
+    (the conservative range avoids extreme thresholds dominated by a single
+    patient flip on small validation folds)."""
     best_thresh, best_f1 = 0.5, 0.0
     for thresh in np.arange(0.20, 0.76, 0.02):
         preds = (probs >= thresh).astype(int)
@@ -210,22 +142,8 @@ def find_best_threshold(probs: np.ndarray,
 
 
 def compute_class_weights(y_train: np.ndarray) -> torch.Tensor:
-    """
-    Compute inverse-frequency class weights from training labels.
-
-    w_c = N / (2 * N_c)
-
-    Computed dynamically so weights are correct for every LTS threshold
-    experiment (12 / 18 / 24 months) without hardcoding cohort sizes.
-
-    Parameters
-    ----------
-    y_train : (N,) binary training labels (0 = non-LTS, 1 = LTS)
-
-    Returns
-    -------
-    torch.FloatTensor([w_nonlts, w_lts])
-    """
+    """Inverse-frequency class weights w_c = N / (2 * N_c), computed dynamically
+    so they're correct for any LTS threshold without hardcoding cohort sizes."""
     n_total  = len(y_train)
     n_lts    = int(y_train.sum())
     n_nonlts = n_total - n_lts
@@ -234,20 +152,8 @@ def compute_class_weights(y_train: np.ndarray) -> torch.Tensor:
     return torch.tensor([w_nonlts, w_lts], dtype=torch.float), n_lts, n_nonlts
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PLOTTING UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
 def significance_stars(p_value: float) -> str:
-    """
-    Convert a p-value to a significance annotation string.
-
-    Returns
-    -------
-    '***'  if p < 0.001
-    '**'   if p < 0.01
-    '*'    if p < 0.05
-    'n.s.' otherwise
-    """
+    """p-value -> '***' / '**' / '*' / 'n.s.'"""
     if   p_value < 0.001: return "***"
     elif p_value < 0.01:  return "**"
     elif p_value < 0.05:  return "*"
@@ -258,41 +164,21 @@ def plot_roc_curves(results: list,
                     output_path: str,
                     title: str = "ROC Curve Comparison",
                     colors: list = None) -> str:
-    """
-    Plot smooth interpolated ROC curves for multiple models on one figure.
-
-    Each entry in `results` must be a dict with keys:
-      'label' (or 'name') : str   — legend label
-      'probs'             : array — predicted probabilities (positive class)
-      'y_true'            : array — ground-truth binary labels
-      'auc'               : float — pre-computed AUC for the legend
-
-    Smoothing is done by deduplicating FPR values and interpolating onto
-    a dense 400-point grid, matching the ablation study plot style.
-
-    Parameters
-    ----------
-    results     : list of dicts (one per model/configuration)
-    output_path : full path to save the PNG (directory must exist)
-    title       : figure title string
-    colors      : optional list of hex color strings (one per result)
-
-    Returns
-    -------
-    output_path : str — path where the figure was saved
-    """
+    """Plot smooth interpolated ROC curves for multiple models on one figure.
+    Each entry in `results` needs 'label'/'name', 'probs', 'y_true', 'auc'."""
     default_colors = [
         "#ff0000", "#00aa22", "#2244ff", "#ff9900",
         "#f2b6c6", "#66d9ff", "#aa00aa", "#bfef45",
-        "#000000",
+        "#000000", "#8B4513", "#e6194b", "#4363d8",
     ]
-    colors = colors or default_colors
+    # Cycle so any number of results is handled without silent truncation
+    color_cycle = itertools.cycle(colors if colors else default_colors)
 
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.plot([0, 1], [0, 1], linestyle="--", color="navy",
             linewidth=1.5, alpha=0.8, label="Random  0.50")
 
-    for res, color in zip(results, colors):
+    for res, color in zip(results, color_cycle):
         label = res.get("label") or res.get("name", "?")
         fpr, tpr, _ = roc_curve(res["y_true"], res["probs"])
 

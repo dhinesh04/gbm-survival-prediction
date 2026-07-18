@@ -1,420 +1,536 @@
-"""
-baseline_comparison.py
-----------------------
-Compares the GCN dual-head model against classical and deep-learning
-baselines on the same held-out test set.
+"""Compares the GCN dual-head model against classical AFT and deep-learning
+survival baselines (Weibull AFT, Log-Normal AFT, Random Survival Forest,
+DeepSurv, DeepHit) on the same held-out test set, using Harrell's C-index
+and Integrated Brier Score (IBS).
 
-BINARY HEAD BASELINES (LTS classification, evaluated by AUC):
-  1.  Logistic Regression        (L2, class-balanced)
-  2.  Naive Bayes                (GaussianNB)
-  3.  K-Nearest Neighbours       (k=11, distance-weighted)
-  4.  Decision Tree              (class-balanced, max_depth=5)
-  5.  Random Forest              (500 trees, class-balanced)
-  6.  Gradient Boosting          (sklearn HistGradientBoosting)
-  7.  Support Vector Machine     (RBF kernel, probability=True)
-  8.  MLP / DNN                  (3-layer, sklearn)
-  [9. GCN (our model)            — injected from gcn_results]
+Two comparisons are run:
+  1. Single train/test split (legacy, kept for continuity with existing
+     report figures) -- one point estimate per model, not on its own strong
+     enough to claim one model beats another.
+  2. 5-fold CV (new) -- every model refit from scratch per fold, using the
+     same StratifiedKFold split (stratified on event status, same
+     random_state) as gcn_train.py / ablation_studies.py. Reports mean±std
+     and is what should drive any "model X beats model Y" claim.
 
-SURVIVAL HEAD BASELINES (time-to-event, evaluated by C-index):
-  1.  CoxPH — Classical          (lifelines, L2 penalised)
-  2.  Lasso-Cox                  (lifelines, L1 penalised)
-  3.  Random Survival Forest     (scikit-survival, 500 trees)
-  4.  Gradient Boosting Survival (scikit-survival)
-  5.  DeepSurv                   (pycox / PyTorch)
-  6.  DeepHit                    (pycox / PyTorch, single-risk)
-  [7. GCN-Cox (our model)        — injected from gcn_results]
-
-All baselines use the SAME feature matrix as the full GCN model
-(mRMR-reduced CNA + mRNA + Methylation + Clinical, concatenated)
-and the SAME train/test split — results are directly comparable.
-
-Features are StandardScaler-normalised before being passed to any
-distance-based or gradient-based model (tree models use raw features).
+Features are StandardScaler-normalised before any distance- or
+gradient-based model; the scaler is refit per fold for the CV comparison.
 """
 
 import os
 import warnings
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model  import LogisticRegression
-from sklearn.naive_bayes   import GaussianNB
-from sklearn.neighbors     import KNeighborsClassifier
-from sklearn.tree          import DecisionTreeClassifier
-from sklearn.ensemble      import (RandomForestClassifier,
-                                   HistGradientBoostingClassifier)
-from sklearn.svm           import SVC
-from sklearn.neural_network import MLPClassifier
-from sklearn.metrics        import roc_auc_score
+from scipy.stats import norm
+from scipy.interpolate import interp1d
 
-from config import RANDOM_STATE
-from src.utils import concordance_index, plot_roc_curves
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold
+from sksurv.metrics import integrated_brier_score
+from sksurv.util import Surv
+
+from config import RANDOM_STATE, N_FOLDS
+from src.utils import concordance_index
 
 warnings.filterwarnings("ignore")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 def _scale(X_train, X_test):
-    """StandardScaler fit on train, applied to both."""
     sc = StandardScaler()
     return sc.fit_transform(X_train), sc.transform(X_test)
 
 
 def _sksurv_y(events, times):
-    """Build scikit-survival structured array target."""
-    return np.array(
-        [(bool(e), float(t)) for e, t in zip(events, times)],
-        dtype=[('event', bool), ('time', float)]
-    )
+    return Surv.from_arrays(event=events.astype(bool), time=times.astype(float))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BINARY BASELINES
-# ─────────────────────────────────────────────────────────────────────────────
-def run_binary_baselines(X_train, y_train, X_test, y_test):
-    """Fit 8 classifiers on training data, evaluate AUC on test set."""
-    X_tr_sc, X_te_sc = _scale(X_train, X_test)
-
-    classifiers = [
-        ("Logistic Regression",
-         LogisticRegression(C=0.1, class_weight='balanced',
-                            max_iter=2000, random_state=RANDOM_STATE),
-         True),
-        ("Naive Bayes",
-         GaussianNB(),
-         True),
-        ("K-Nearest Neighbours",
-         KNeighborsClassifier(n_neighbors=11, weights='distance',
-                              metric='euclidean'),
-         True),
-        ("Decision Tree",
-         DecisionTreeClassifier(max_depth=5, class_weight='balanced',
-                                random_state=RANDOM_STATE),
-         False),
-        ("Random Forest",
-         RandomForestClassifier(n_estimators=500, class_weight='balanced',
-                                max_features='sqrt', random_state=RANDOM_STATE,
-                                n_jobs=-1),
-         False),
-        ("Gradient Boosting",
-         HistGradientBoostingClassifier(max_iter=300, max_depth=4,
-                                        learning_rate=0.05,
-                                        random_state=RANDOM_STATE),
-         False),
-        ("SVM (RBF)",
-         SVC(kernel='rbf', C=1.0, gamma='scale', probability=True,
-             class_weight='balanced', random_state=RANDOM_STATE),
-         True),
-        ("MLP / DNN",
-         MLPClassifier(hidden_layer_sizes=(128, 64, 32),
-                       activation='relu', alpha=0.001,
-                       max_iter=500, random_state=RANDOM_STATE,
-                       early_stopping=True, validation_fraction=0.15),
-         True),
-    ]
-
-    results = []
-    print("\n── Binary Baselines ────────────────────────────────────────────")
-    print(f"  {'Model':<28} {'Test AUC':>9}")
-    print("  " + "-" * 40)
-
-    for name, clf, scaled in classifiers:
-        Xtr = X_tr_sc if scaled else X_train
-        Xte = X_te_sc if scaled else X_test
-        clf.fit(Xtr, y_train)
-        probs = clf.predict_proba(Xte)[:, 1]
-        auc   = roc_auc_score(y_test, probs)
-        results.append({"name": name, "auc": auc,
-                        "probs": probs, "y_true": y_test})
-        print(f"  {name:<28} {auc:>9.4f}")
-
-    return results
+def _interpolate_surv(times, surv_matrix, time_grid):
+    """Interpolate pycox survival curves (times x patients) onto the shared
+    IBS time_grid, clipped to [0, 1] to avoid extrapolation artifacts."""
+    f = interp1d(times, surv_matrix, axis=0, fill_value="extrapolate")
+    return np.clip(f(time_grid).T, 0.0, 1.0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SURVIVAL BASELINES
-# ─────────────────────────────────────────────────────────────────────────────
+# per-model (train, val) fit+score functions, shared by the single-split and
+# CV comparisons below so each model's fitting logic lives in exactly one place
+def _cv_weibull_aft(X_tr, t_tr, e_tr, X_val, t_val, e_val,
+                    time_grid, y_tr_sksurv, y_val_sksurv):
+    from lifelines import WeibullAFTFitter
+    cols  = [f"f{i}" for i in range(X_tr.shape[1])]
+    df_tr = pd.DataFrame(X_tr, columns=cols)
+    df_tr['time'], df_tr['event'] = t_tr, e_tr
+    df_val = pd.DataFrame(X_val, columns=cols)
+
+    weibull = WeibullAFTFitter(penalizer=0.5)  # higher penalizer to force convergence on collinear omics data
+    weibull.fit(df_tr, duration_col='time', event_col='event')
+
+    risk = -weibull.predict_expectation(df_val).values  # longer expected survival = lower risk
+    ci   = concordance_index(risk, t_val, e_val)
+
+    ibs = float('nan')
+    if time_grid is not None:
+        try:
+            surv_df = weibull.predict_survival_function(df_val, times=time_grid)
+            ibs = integrated_brier_score(y_tr_sksurv, y_val_sksurv, surv_df.values.T, time_grid)
+        except Exception:
+            ibs = float('nan')
+    return ci, ibs
+
+
+def _cv_lognormal_aft(X_tr, t_tr, e_tr, X_val, t_val, e_val,
+                      time_grid, y_tr_sksurv, y_val_sksurv):
+    from lifelines import LogNormalAFTFitter
+    cols  = [f"f{i}" for i in range(X_tr.shape[1])]
+    df_tr = pd.DataFrame(X_tr, columns=cols)
+    df_tr['time'], df_tr['event'] = t_tr, e_tr
+    df_val = pd.DataFrame(X_val, columns=cols)
+
+    lognorm = LogNormalAFTFitter(penalizer=0.1)
+    lognorm.fit(df_tr, duration_col='time', event_col='event')
+
+    risk = -lognorm.predict_expectation(df_val).values
+    ci   = concordance_index(risk, t_val, e_val)
+
+    ibs = float('nan')
+    if time_grid is not None:
+        try:
+            surv_df = lognorm.predict_survival_function(df_val, times=time_grid)
+            ibs = integrated_brier_score(y_tr_sksurv, y_val_sksurv, surv_df.values.T, time_grid)
+        except Exception:
+            ibs = float('nan')
+    return ci, ibs
+
+
+def _cv_rsf(X_tr, t_tr, e_tr, X_val, t_val, e_val,
+           time_grid, y_tr_sksurv, y_val_sksurv):
+    from sksurv.ensemble import RandomSurvivalForest
+    rsf = RandomSurvivalForest(n_estimators=500, max_features='sqrt',
+                               random_state=RANDOM_STATE, n_jobs=-1)
+    rsf.fit(X_tr, y_tr_sksurv)
+
+    risk = rsf.predict(X_val)
+    ci   = concordance_index(risk, t_val, e_val)
+
+    ibs = float('nan')
+    if time_grid is not None:
+        try:
+            surv_funcs  = rsf.predict_survival_function(X_val)
+            surv_matrix = np.array([fn(time_grid) for fn in surv_funcs])
+            ibs = integrated_brier_score(y_tr_sksurv, y_val_sksurv, surv_matrix, time_grid)
+        except Exception:
+            ibs = float('nan')
+    return ci, ibs
+
+
+def _cv_deepsurv(X_tr, t_tr, e_tr, X_val, t_val, e_val,
+                time_grid, y_tr_sksurv, y_val_sksurv):
+    import torchtuples as tt
+    from pycox.models import CoxPH as PyCoxCoxPH
+
+    Xtr_f, Xval_f = X_tr.astype(np.float32), X_val.astype(np.float32)
+    y_ds_tr = (t_tr.astype(np.float32), e_tr.astype(np.float32))
+
+    net_ds   = tt.practical.MLPVanilla(Xtr_f.shape[1], [64, 64], 1, batch_norm=True, dropout=0.3)
+    model_ds = PyCoxCoxPH(net_ds, tt.optim.Adam(0.001))
+    model_ds.fit(Xtr_f, y_ds_tr, batch_size=64, epochs=100,
+                callbacks=[tt.callbacks.EarlyStopping(patience=15)], verbose=False)
+    _ = model_ds.compute_baseline_hazards()  # needed before it can output a survival curve S(t)
+
+    risk = model_ds.predict(Xval_f).flatten()
+    ci   = concordance_index(risk, t_val, e_val)
+
+    ibs = float('nan')
+    if time_grid is not None:
+        try:
+            surv_df_ds  = model_ds.predict_surv_df(Xval_f)
+            surv_matrix = _interpolate_surv(surv_df_ds.index.values, surv_df_ds.values, time_grid)
+            ibs = integrated_brier_score(y_tr_sksurv, y_val_sksurv, surv_matrix, time_grid)
+        except Exception:
+            ibs = float('nan')
+    return ci, ibs
+
+
+def _cv_deephit(X_tr, t_tr, e_tr, X_val, t_val, e_val,
+               time_grid, y_tr_sksurv, y_val_sksurv):
+    import torchtuples as tt
+    from pycox.models import DeepHitSingle
+
+    Xtr_f, Xval_f = X_tr.astype(np.float32), X_val.astype(np.float32)
+    labtrans = DeepHitSingle.label_transform(20)
+    y_dh_tr  = labtrans.fit_transform(t_tr.astype(np.float32), e_tr.astype(np.float32))
+
+    net_dh   = tt.practical.MLPVanilla(Xtr_f.shape[1], [64, 64], labtrans.out_features,
+                                       batch_norm=True, dropout=0.3)
+    model_dh = DeepHitSingle(net_dh, tt.optim.Adam(0.001), alpha=0.2, sigma=0.1,
+                             duration_index=labtrans.cuts)
+    model_dh.fit(Xtr_f, y_dh_tr, batch_size=64, epochs=100,
+                callbacks=[tt.callbacks.EarlyStopping(patience=15)], verbose=False)
+
+    surv_df_dh = model_dh.predict_surv_df(Xval_f)
+
+    def _median_surv(col):
+        below = (col <= 0.5).values
+        return col.index[below.argmax()] if below.any() else col.index[-1]
+
+    risk = -surv_df_dh.apply(_median_surv).values
+    ci   = concordance_index(risk, t_val, e_val)
+
+    ibs = float('nan')
+    if time_grid is not None:
+        try:
+            surv_matrix = _interpolate_surv(surv_df_dh.index.values, surv_df_dh.values, time_grid)
+            ibs = integrated_brier_score(y_tr_sksurv, y_val_sksurv, surv_matrix, time_grid)
+        except Exception:
+            ibs = float('nan')
+    return ci, ibs
+
+
+_CV_MODEL_FNS = [
+    ("Weibull AFT",    _cv_weibull_aft),
+    ("Log-Normal AFT", _cv_lognormal_aft),
+    ("RSF",            _cv_rsf),
+    ("DeepSurv",       _cv_deepsurv),
+    ("DeepHit",        _cv_deephit),
+]
+
+
 def run_survival_baselines(X_train, times_train, events_train,
                            X_test,  times_test,  events_test):
-    """Fit 6 survival models, evaluate Harrell C-index on test set."""
+    """Fit each baseline once on the full training set, evaluate once on the
+    held-out test set. Single point estimate -- see run_survival_baselines_cv()
+    for the comparison that should actually drive any claim."""
     X_tr_sc, X_te_sc = _scale(X_train, X_test)
+    y_tr_sksurv = _sksurv_y(events_train, times_train)
+    y_te_sksurv = _sksurv_y(events_test, times_test)
+
+    # IPCW time grid must stay strictly inside the observed training times
+    t_min = max(times_train[events_train==1].min(), times_test[events_test==1].min()) + 0.1
+    t_max = min(times_train[events_train==1].max(), times_test.max()) - 0.1
+    time_grid = np.linspace(t_min, t_max, 100)
+
     results = []
+    print("\n── Survival Baselines — single train/test split (legacy) ───────")
+    print(f"  {'Model':<30} {'C-index':>9} {'IBS':>9}")
+    print("  " + "-" * 50)
 
-    print("\n── Survival Baselines ──────────────────────────────────────────")
-    print(f"  {'Model':<35} {'C-index':>9}")
-    print("  " + "-" * 47)
+    for name, fn in _CV_MODEL_FNS:
+        try:
+            ci, ibs = fn(X_tr_sc, times_train, events_train,
+                        X_te_sc, times_test, events_test,
+                        time_grid, y_tr_sksurv, y_te_sksurv)
+            results.append({"name": name, "cindex": ci, "ibs": ibs})
+            print(f"  {name:<30} {ci:>9.4f} {ibs:>9.4f}")
+        except Exception as ex:
+            print(f"  {name} failed: {ex}")
 
-    # ── 1. Classical CoxPH (L2) ──────────────────────────────────────────
-    try:
-        from lifelines import CoxPHFitter
-        import pandas as pd
-
-        cols = [f"f{i}" for i in range(X_tr_sc.shape[1])]
-        df_tr = pd.DataFrame(X_tr_sc, columns=cols)
-        df_tr['time']  = times_train
-        df_tr['event'] = events_train.astype(int)
-        df_te = pd.DataFrame(X_te_sc, columns=cols)
-
-        cph = CoxPHFitter(penalizer=0.1)
-        cph.fit(df_tr, duration_col='time', event_col='event')
-        risk = cph.predict_partial_hazard(df_te).values
-        ci   = concordance_index(risk, times_test, events_test)
-        results.append({"name": "CoxPH (L2)", "cindex": ci})
-        print(f"  {'CoxPH (L2)':<35} {ci:>9.4f}")
-    except Exception as ex:
-        print(f"  CoxPH failed: {ex}")
-
-    # ── 2. Lasso-Cox ─────────────────────────────────────────────────────
-    try:
-        from lifelines import CoxPHFitter
-        import pandas as pd
-
-        cols = [f"f{i}" for i in range(X_tr_sc.shape[1])]
-        df_tr = pd.DataFrame(X_tr_sc, columns=cols)
-        df_tr['time']  = times_train
-        df_tr['event'] = events_train.astype(int)
-        df_te = pd.DataFrame(X_te_sc, columns=cols)
-
-        lasso_cph = CoxPHFitter(penalizer=1.0, l1_ratio=1.0)
-        lasso_cph.fit(df_tr, duration_col='time', event_col='event')
-        risk = lasso_cph.predict_partial_hazard(df_te).values
-        ci   = concordance_index(risk, times_test, events_test)
-        results.append({"name": "Lasso-Cox", "cindex": ci})
-        print(f"  {'Lasso-Cox':<35} {ci:>9.4f}")
-    except Exception as ex:
-        print(f"  Lasso-Cox failed: {ex}")
-
-    # ── 3. Random Survival Forest ─────────────────────────────────────────
-    try:
-        from sksurv.ensemble import RandomSurvivalForest
-
-        y_tr = _sksurv_y(events_train, times_train)
-        y_te = _sksurv_y(events_test,  times_test)
-
-        rsf = RandomSurvivalForest(n_estimators=500, max_features='sqrt',
-                                   random_state=RANDOM_STATE, n_jobs=-1)
-        rsf.fit(X_train, y_tr)
-        risk = rsf.predict(X_test)
-        ci   = concordance_index(risk, times_test, events_test)
-        results.append({"name": "Random Survival Forest", "cindex": ci})
-        print(f"  {'Random Survival Forest':<35} {ci:>9.4f}")
-    except Exception as ex:
-        print(f"  Random Survival Forest failed: {ex}")
-
-    # ── 4. Gradient Boosting Survival ─────────────────────────────────────
-    try:
-        from sksurv.ensemble import GradientBoostingSurvivalAnalysis
-
-        y_tr = _sksurv_y(events_train, times_train)
-        gbsa = GradientBoostingSurvivalAnalysis(
-            n_estimators=200, learning_rate=0.05,
-            max_depth=3, random_state=RANDOM_STATE)
-        gbsa.fit(X_train, y_tr)
-        risk = gbsa.predict(X_test)
-        ci   = concordance_index(risk, times_test, events_test)
-        results.append({"name": "GB Survival", "cindex": ci})
-        print(f"  {'GB Survival':<35} {ci:>9.4f}")
-    except Exception as ex:
-        print(f"  GB Survival failed: {ex}")
-
-    # ── 5. DeepSurv ───────────────────────────────────────────────────────
-    try:
-        import torchtuples as tt
-        from pycox.models import CoxPH as PyCoxCoxPH
-
-        Xtr_f = X_tr_sc.astype(np.float32)
-        Xte_f = X_te_sc.astype(np.float32)
-        y_ds_tr = (times_train.astype(np.float32),
-                   events_train.astype(np.float32))
-
-        net_ds = tt.practical.MLPVanilla(
-            Xtr_f.shape[1], [64, 64], 1,
-            batch_norm=True, dropout=0.3)
-        model_ds = PyCoxCoxPH(net_ds, tt.optim.Adam(0.001))
-        model_ds.fit(Xtr_f, y_ds_tr,
-                     batch_size=64, epochs=100,
-                     callbacks=[tt.callbacks.EarlyStopping(patience=15)],
-                     verbose=False)
-
-        risk = model_ds.predict(Xte_f).flatten()
-        ci   = concordance_index(risk, times_test, events_test)
-        results.append({"name": "DeepSurv", "cindex": ci})
-        print(f"  {'DeepSurv':<35} {ci:>9.4f}")
-    except Exception as ex:
-        print(f"  DeepSurv failed: {ex}")
-
-    # ── 6. DeepHit ────────────────────────────────────────────────────────
-    try:
-        import torchtuples as tt
-        from pycox.models import DeepHitSingle
-
-        num_durations = 20
-        labtrans = DeepHitSingle.label_transform(num_durations)
-        y_dh_tr  = labtrans.fit_transform(
-            times_train.astype(np.float32),
-            events_train.astype(np.float32))
-
-        Xtr_f = X_tr_sc.astype(np.float32)
-        Xte_f = X_te_sc.astype(np.float32)
-
-        net_dh = tt.practical.MLPVanilla(
-            Xtr_f.shape[1], [64, 64], labtrans.out_features,
-            batch_norm=True, dropout=0.3)
-        model_dh = DeepHitSingle(net_dh, tt.optim.Adam(0.001),
-                                 alpha=0.2, sigma=0.1,
-                                 duration_index=labtrans.cuts)
-        model_dh.fit(Xtr_f, y_dh_tr,
-                     batch_size=64, epochs=100,
-                     callbacks=[tt.callbacks.EarlyStopping(patience=15)],
-                     verbose=False)
-
-        surv = model_dh.predict_surv_df(Xte_f)
-        risk = -surv.index[surv.apply(
-            lambda col: (col <= 0.5).idxmax()
-        )].values
-        ci   = concordance_index(risk, times_test, events_test)
-        results.append({"name": "DeepHit", "cindex": ci})
-        print(f"  {'DeepHit':<35} {ci:>9.4f}")
-    except Exception as ex:
-        print(f"  DeepHit failed: {ex}")
-
-    return results
+    return results, time_grid, y_tr_sksurv, y_te_sksurv
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PLOTS
-# ─────────────────────────────────────────────────────────────────────────────
-def _plot_survival_bars(surv_results, gcn_cindex, output_dir, title_suffix=""):
-    names = [r["name"] for r in surv_results] + ["GCN-Cox (ours)"]
-    cis   = [r["cindex"] for r in surv_results] + [gcn_cindex]
-    order   = np.argsort(cis)
-    names_s = [names[i] for i in order]
-    cis_s   = [cis[i]   for i in order]
-    colors  = ["#1a1a1a" if "GCN" in n else "#4c72b0" for n in names_s]
+def run_survival_baselines_cv(X_train, times_train, events_train, n_folds=N_FOLDS):
+    """5-fold CV evaluation of every classical/deep survival baseline, using the
+    same StratifiedKFold split (event status, same random_state) as gcn_train.py
+    / ablation_studies.py so the resulting mean±std is directly comparable to
+    the GCN's own CV numbers. Each model is refit per fold with its own
+    StandardScaler (fit on that fold only, no leakage); the IBS time grid is
+    rebuilt per fold, bounded to that fold's own event times.
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    bars = ax.barh(names_s, cis_s, color=colors, edgecolor='white', height=0.6)
-    for bar, val in zip(bars, cis_s):
-        ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
-                f"{val:.3f}", va='center', ha='left', fontsize=10)
-
-    ax.axvline(0.5, linestyle='--', color='red', linewidth=1.2,
-               alpha=0.7, label='Random (0.50)')
-    ax.set_xlabel("Harrell's C-index", fontsize=12)
-    ax.set_title(f"GBM Survival Prediction\nC-index Comparison"
-                 f"{' — ' + title_suffix if title_suffix else ''}",
-                 fontsize=14)
-    ax.set_xlim(0.3, min(1.0, max(cis_s) + 0.08))
-    ax.legend(fontsize=10);  ax.grid(axis='x', alpha=0.3)
-
-    path = f"{output_dir}/baseline_survival_cindex.png"
-    plt.tight_layout()
-    plt.savefig(path, dpi=180, bbox_inches='tight')
-    plt.close()
-    print(f"  Survival C-index plot saved → {path}")
-    return path
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SUMMARY TABLES
-# ─────────────────────────────────────────────────────────────────────────────
-def _print_binary_summary(binary_results, gcn_auc):
-    print("\n" + "=" * 55)
-    print("  BINARY CLASSIFICATION — SUMMARY (Test AUC)")
-    print("=" * 55)
-    all_r = binary_results + [{"name": "GCN (ours)", "auc": gcn_auc}]
-    for r in sorted(all_r, key=lambda x: -x["auc"]):
-        marker = " <--" if "GCN" in r["name"] else ""
-        print(f"  {r['name']:<30} {r['auc']:.4f}{marker}")
-    print("=" * 55)
-
-
-def _print_survival_summary(surv_results, gcn_cindex):
-    print("\n" + "=" * 55)
-    print("  SURVIVAL MODELS — SUMMARY (C-index)")
-    print("=" * 55)
-    all_r = surv_results + [{"name": "GCN-Cox (ours)", "cindex": gcn_cindex}]
-    for r in sorted(all_r, key=lambda x: -x["cindex"]):
-        marker = " <--" if "GCN" in r["name"] else ""
-        print(f"  {r['name']:<35} {r['cindex']:.4f}{marker}")
-    print("=" * 55)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-def run_baseline_comparison(pipeline: dict, gcn_results: dict,
-                             output_dir: str = "plots",
-                             title_suffix: str = ""):
+    Returns a list of dicts: name, cv_cindex_mean, cv_cindex_std, cv_ibs_mean, cv_ibs_std.
     """
-    Run all baseline comparisons and generate plots.
+    fold_cindex = {name: [] for name, _ in _CV_MODEL_FNS}
+    fold_ibs    = {name: [] for name, _ in _CV_MODEL_FNS}
 
-    Parameters
-    ----------
-    pipeline     : dict returned by main.main()
-    gcn_results  : dict returned by train_gcn()
-    output_dir   : directory to save plots
-    title_suffix : optional string added to plot titles (e.g. 'LTS=12m')
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+
+    print(f"\n── Survival Baselines — {n_folds}-fold CV "
+          f"(stratified on event status, same split as GCN's own CV) ──")
+
+    for fold_i, (tr_idx, val_idx) in enumerate(
+            skf.split(X_train, events_train.astype(int)), start=1):
+
+        X_fold_tr, X_fold_val = X_train[tr_idx], X_train[val_idx]
+        t_fold_tr, t_fold_val = times_train[tr_idx], times_train[val_idx]
+        e_fold_tr, e_fold_val = events_train[tr_idx], events_train[val_idx]
+
+        X_fold_tr_sc, X_fold_val_sc = _scale(X_fold_tr, X_fold_val)
+        y_fold_tr_sksurv  = _sksurv_y(e_fold_tr, t_fold_tr)
+        y_fold_val_sksurv = _sksurv_y(e_fold_val, t_fold_val)
+
+        # upper bound uses the fold's overall max time (event + censored), not
+        # just its max event time -- a censored longest-follow-up patient would
+        # otherwise produce a grid that silently exceeds the true IPCW bound
+        fold_time_grid = None
+        try:
+            ft_min_bound = max(t_fold_tr[e_fold_tr == 1].min(),
+                               t_fold_val[e_fold_val == 1].min())
+            ft_max_bound = min(t_fold_tr.max(), t_fold_val.max())
+            margin = max(0.1, 0.01 * (ft_max_bound - ft_min_bound))
+            ft_min = ft_min_bound + margin
+            ft_max = ft_max_bound - margin
+            if ft_max > ft_min:
+                fold_time_grid = np.linspace(ft_min, ft_max, 50)
+        except Exception:
+            fold_time_grid = None
+
+        grid_note = "" if fold_time_grid is not None else "  [IBS grid degenerate this fold]"
+        print(f"  Fold {fold_i}/{n_folds}  (train={len(tr_idx)}, val={len(val_idx)}){grid_note}")
+
+        for name, fn in _CV_MODEL_FNS:
+            try:
+                ci, ibs = fn(X_fold_tr_sc, t_fold_tr, e_fold_tr,
+                            X_fold_val_sc, t_fold_val, e_fold_val,
+                            fold_time_grid, y_fold_tr_sksurv, y_fold_val_sksurv)
+            except Exception as ex:
+                print(f"    {name} failed on fold {fold_i}: {ex}")
+                ci, ibs = float('nan'), float('nan')
+            fold_cindex[name].append(ci)
+            fold_ibs[name].append(ibs)
+
+    cv_results = []
+    for name, _ in _CV_MODEL_FNS:
+        ci_vals  = [v for v in fold_cindex[name] if not np.isnan(v)]
+        ibs_vals = [v for v in fold_ibs[name]    if not np.isnan(v)]
+        row = {
+            "name": name,
+            "cv_cindex_mean": float(np.mean(ci_vals))  if ci_vals  else float('nan'),
+            "cv_cindex_std":  float(np.std(ci_vals))   if ci_vals  else float('nan'),
+            "cv_ibs_mean":    float(np.mean(ibs_vals)) if ibs_vals else float('nan'),
+            "cv_ibs_std":     float(np.std(ibs_vals))  if ibs_vals else float('nan'),
+        }
+        cv_results.append(row)
+        print(f"  {name:<16}  CV C-idx={row['cv_cindex_mean']:.4f}±{row['cv_cindex_std']:.4f}  "
+              f"CV IBS={row['cv_ibs_mean']:.4f}±{row['cv_ibs_std']:.4f}")
+
+    return cv_results
+
+
+def _plot_metrics(results_list, metric_key, xlabel, title, output_path, reverse_sort=False):
+    """Minimalist horizontal barplot for the single-split comparison."""
+    names = [r["name"] for r in results_list]
+    vals  = [r[metric_key] for r in results_list]
+
+    order = np.argsort(vals)
+    if reverse_sort:
+        order = order[::-1]
+
+    names_s = [names[i] for i in order]
+    vals_s  = [vals[i]   for i in order]
+    colors  = ["#2b2b2b" if "GCN" in n else "#e0e0e0" for n in names_s]
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.yaxis.set_ticks_position('none')
+
+    bars = ax.barh(names_s, vals_s, color=colors, height=0.5)
+
+    for bar, val in zip(bars, vals_s):
+        ax.text(bar.get_width() + (0.01 if not reverse_sort else -0.01),
+                bar.get_y() + bar.get_height() / 2,
+                f"{val:.3f}", va='center', ha='left' if not reverse_sort else 'right',
+                fontsize=9, color="#2b2b2b")
+
+    ax.set_xlabel(xlabel, fontsize=10, color="#4a4a4a")
+    ax.set_title(title, fontsize=12, pad=15)
+
+    if metric_key == "cindex":
+        ax.axvline(0.5, linestyle='--', color='#a0a0a0', linewidth=1.0, zorder=0)
+        ax.set_xlim(0.3, min(1.0, max(vals_s) + 0.1))
+    else:
+        ax.set_xlim(0.0, max(vals_s) + 0.05)  # IBS: lower is better
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200, bbox_inches='tight')
+    plt.close()
+
+
+def _plot_cv_metrics(cv_results, gcn_cv_row, output_dir):
+    all_rows = list(cv_results)
+    if gcn_cv_row is not None:
+        all_rows.append(gcn_cv_row)
+
+    names     = [r["name"] for r in all_rows]
+    ci_means  = [r["cv_cindex_mean"] for r in all_rows]
+    ci_stds   = [r["cv_cindex_std"]  for r in all_rows]
+    ibs_means = [r["cv_ibs_mean"]    for r in all_rows]
+    ibs_stds  = [r["cv_ibs_std"]     for r in all_rows]
+    colors    = ["#2b2b2b" if "GCN" in n else "#9fb8d8" for n in names]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    order_ci = np.argsort(ci_means)
+    axes[0].barh([names[i] for i in order_ci], [ci_means[i] for i in order_ci],
+                xerr=[ci_stds[i] for i in order_ci],
+                color=[colors[i] for i in order_ci], capsize=4)
+    axes[0].set_xlabel("CV C-index (mean ± std)")
+    axes[0].set_title("Risk Ranking — 5-fold CV")
+    axes[0].axvline(0.5, linestyle='--', color='red', alpha=0.4)
+
+    valid_ibs_idx = [i for i, v in enumerate(ibs_means) if not np.isnan(v)]
+    order_ibs = sorted(valid_ibs_idx, key=lambda i: ibs_means[i], reverse=True)
+    axes[1].barh([names[i] for i in order_ibs], [ibs_means[i] for i in order_ibs],
+                xerr=[ibs_stds[i] for i in order_ibs],
+                color=[colors[i] for i in order_ibs], capsize=4)
+    axes[1].set_xlabel("CV IBS (mean ± std, lower better)")
+    axes[1].set_title("Calibration — 5-fold CV")
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, "baseline_cv_comparison.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"\n  CV comparison plot saved → {path}")
+
+
+def _print_summary(all_results):
+    print("\n" + "=" * 55)
+    print("  SURVIVAL MODELS — SINGLE-SPLIT SUMMARY (legacy)")
+    print("=" * 55)
+    print(f"  {'Model':<30} {'C-index':>9} {'IBS':>9}")
+    print("  " + "-" * 51)
+
+    for r in sorted(all_results, key=lambda x: x.get("ibs", float('inf'))
+                     if x.get("ibs") is not None else float('inf')):
+        marker = " <--" if "GCN" in r["name"] else ""
+        c_str = f"{r['cindex']:.4f}" if r.get("cindex") is not None else "N/A"
+        ibs_str = f"{r['ibs']:.4f}" if r.get("ibs") is not None else "N/A"
+        print(f"  {r['name']:<30} {c_str:>9} {ibs_str:>9}{marker}")
+    print("=" * 55)
+    print("  ⚠ Single point estimate per model — see the CV summary below "
+          "before drawing any conclusion about which model is better.")
+
+
+def _print_cv_summary(cv_results, gcn_cv_row=None):
+    print("\n" + "=" * 70)
+    print("  SURVIVAL MODELS — 5-FOLD CV SUMMARY (mean ± std)")
+    print("=" * 70)
+    all_rows = list(cv_results)
+    if gcn_cv_row is not None:
+        all_rows.append(gcn_cv_row)
+
+    print(f"  {'Model':<22} {'CV C-index':>16}  {'CV IBS':>16}")
+    print("  " + "-" * 58)
+    for r in sorted(all_rows, key=lambda x: x["cv_ibs_mean"]
+                     if not np.isnan(x["cv_ibs_mean"]) else float('inf')):
+        marker  = " <--" if "GCN" in r["name"] else ""
+        ci_str  = f"{r['cv_cindex_mean']:.4f}±{r['cv_cindex_std']:.4f}"
+        ibs_str = f"{r['cv_ibs_mean']:.4f}±{r['cv_ibs_std']:.4f}"
+        print(f"  {r['name']:<22} {ci_str:>16}  {ibs_str:>16}{marker}")
+    print("=" * 70)
+
+    if gcn_cv_row is not None:
+        best_baseline_ci = max(cv_results, key=lambda r: r["cv_cindex_mean"])
+        gcn_lower  = gcn_cv_row["cv_cindex_mean"]      - gcn_cv_row["cv_cindex_std"]
+        base_upper = best_baseline_ci["cv_cindex_mean"] + best_baseline_ci["cv_cindex_std"]
+        overlap = gcn_lower <= base_upper
+
+        print(f"\n  Best baseline CV C-index: {best_baseline_ci['name']} "
+              f"({best_baseline_ci['cv_cindex_mean']:.4f}±{best_baseline_ci['cv_cindex_std']:.4f})")
+        print(f"  GCN CV C-index:           "
+              f"{gcn_cv_row['cv_cindex_mean']:.4f}±{gcn_cv_row['cv_cindex_std']:.4f}")
+        if overlap:
+            print(f"  ⚠ GCN's std band overlaps the best baseline's — the "
+                  f"apparent GCN advantage is not clearly distinguishable "
+                  f"from CV fold-to-fold noise.")
+        else:
+            print(f"  ✓ GCN's std band does NOT overlap the best baseline's "
+                  f"— GCN's advantage holds up under CV.")
+    else:
+        print(f"\n  [GCN CV row unavailable — see warning above. Only "
+              f"baseline-vs-baseline CV comparison shown; GCN cannot yet "
+              f"be placed on this table.]")
+    print("=" * 70)
+
+
+def run_baseline_comparison(pipeline: dict, gcn_results: dict, output_dir: str = "plots"):
+    """Run survival baselines against GCN AFT/Cox outputs, both as a single
+    train/test split (legacy) and as 5-fold CV (the comparison that should
+    actually drive any "model X beats model Y" claim).
+
+    For the CV comparison to include GCN's own row, gcn_results needs
+    cv_val_cindex_mean/std and cv_val_ibs_mean/std (CV mean/std across the
+    same 5 folds GCN was trained on); otherwise the CV table still runs for
+    the baselines alone, with a warning that GCN's row is unavailable.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     X_train = np.hstack([pipeline["cna_tr_r"],  pipeline["mrna_tr_r"],
-                          pipeline["meth_tr_r"], pipeline["clin_tr_arr"]])
-    X_test  = np.hstack([pipeline["cna_te"],     pipeline["mrna_te"],
-                          pipeline["meth_te"],    pipeline["clin_te"]])
+                         pipeline["meth_tr_r"], pipeline["clin_tr_arr"]])
+    X_test  = np.hstack([pipeline["cna_te"],    pipeline["mrna_te"],
+                         pipeline["meth_te"],   pipeline["clin_te"]])
 
-    y_train = pipeline["y_train"].values
-    y_test  = pipeline["y_test"].values
     t_train = pipeline["os_months_train"].values.astype(float)
     e_train = pipeline["os_status_train"].values.astype(float)
     t_test  = pipeline["os_months_test"].values.astype(float)
     e_test  = pipeline["os_status_test"].values.astype(float)
 
     print("\n" + "=" * 62)
-    print("  BASELINE COMPARISON" + (f" — {title_suffix}" if title_suffix else ""))
-    print("=" * 62)
-    print(f"  Feature matrix: {X_train.shape[1]} features "
-          f"(CNA+mRNA+Meth+Clinical, mRMR-reduced)")
-    print(f"  Train: {len(y_train)} | Test: {len(y_test)}")
-    print(f"  LTS train={int(y_train.sum())} | LTS test={int(y_test.sum())}")
+    print("  BASELINE COMPARISON (CONTINUOUS SURVIVAL)")
     print("=" * 62)
 
-    gcn_auc    = gcn_results["auc"]
-    gcn_probs  = gcn_results["probs"]
-    gcn_ytrue  = gcn_results["y_true"]
-    gcn_cindex = gcn_results["cindex"]
+    surv_results, time_grid, y_tr_sksurv, y_te_sksurv = run_survival_baselines(
+        X_train, t_train, e_train, X_test, t_test, e_test
+    )
 
-    binary_results = run_binary_baselines(X_train, y_train, X_test, y_test)
-    surv_results   = run_survival_baselines(X_train, t_train, e_train,
-                                            X_test,  t_test,  e_test)
+    gcn_cindex = gcn_results.get("cindex", None)
+    gcn_ibs    = None
+    if "pred_log_t" in gcn_results and "sigma" in gcn_results:
+        try:
+            mu_test = np.array(gcn_results["pred_log_t"]).reshape(-1, 1)
+            sigma   = float(gcn_results["sigma"])
+            log_t   = np.log(time_grid).reshape(1, -1)
+            gcn_surv_matrix = norm.sf((log_t - mu_test) / sigma)
+            gcn_ibs = integrated_brier_score(y_tr_sksurv, y_te_sksurv, gcn_surv_matrix, time_grid)
+        except Exception as e:
+            print(f"\n  [Warning] Could not calculate GCN IBS (single split): {e}")
 
-    _print_binary_summary(binary_results, gcn_auc)
-    _print_survival_summary(surv_results, gcn_cindex)
+    gcn_entry = {"name": "GCN AFT+Cox (ours)", "cindex": gcn_cindex, "ibs": gcn_ibs}
+    all_results = surv_results + [gcn_entry]
+    _print_summary(all_results)
 
-    # ── ROC plot — baselines + GCN as last entry (black) ─────────────────────
-    # Rename 'name' → 'label' for plot_roc_curves compatibility, then append GCN
-    roc_entries = [{"label": r["name"], "probs": r["probs"],
-                    "y_true": r["y_true"], "auc": r["auc"]}
-                   for r in binary_results]
-    roc_entries.append({"label": "GCN (ours)", "probs": gcn_probs,
-                        "y_true": gcn_ytrue,   "auc": gcn_auc})
+    valid_cindex = [r for r in all_results if r["cindex"] is not None]
+    valid_ibs    = [r for r in all_results if r["ibs"] is not None]
+    if valid_cindex:
+        _plot_metrics(valid_cindex, "cindex", "Harrell's C-index (Higher = Better)",
+                      "Model Risk Ranking Calibration", f"{output_dir}/baseline_cindex.png")
+    if valid_ibs:
+        _plot_metrics(valid_ibs, "ibs", "Integrated Brier Score (Lower = Better)",
+                      "Time-to-Event Absolute Accuracy", f"{output_dir}/baseline_ibs.png",
+                      reverse_sort=True)
 
-    baseline_colors = [
-        "#e6194b", "#3cb44b", "#4363d8", "#f58231",
-        "#911eb4", "#42d4f4", "#f032e6", "#bfef45", "#000000",
-    ]
-    title = (f"GBM LTS Binary Classification\nROC Curve Comparison"
-             f"{' — ' + title_suffix if title_suffix else ''}")
-    plot_roc_curves(roc_entries,
-                    output_path=f"{output_dir}/baseline_binary_roc.png",
-                    title=title,
-                    colors=baseline_colors)
+    print("\n" + "=" * 62)
+    print("  BASELINE COMPARISON — 5-FOLD CV")
+    print("=" * 62)
+    cv_results = run_survival_baselines_cv(X_train, t_train, e_train, n_folds=N_FOLDS)
 
-    _plot_survival_bars(surv_results, gcn_cindex, output_dir, title_suffix)
+    gcn_cv_row = None
+    required_keys = ["cv_val_cindex_mean", "cv_val_cindex_std",
+                     "cv_val_ibs_mean", "cv_val_ibs_std"]
+    if all(k in gcn_results for k in required_keys):
+        gcn_cv_row = {
+            "name": "GCN AFT+Cox (ours)",
+            "cv_cindex_mean": gcn_results["cv_val_cindex_mean"],
+            "cv_cindex_std":  gcn_results["cv_val_cindex_std"],
+            "cv_ibs_mean":    gcn_results["cv_val_ibs_mean"],
+            "cv_ibs_std":     gcn_results["cv_val_ibs_std"],
+        }
+    else:
+        missing = [k for k in required_keys if k not in gcn_results]
+        print(f"\n  ⚠ gcn_results is missing {missing} — GCN's own CV "
+              f"mean±std cannot be placed alongside the baselines' CV "
+              f"numbers yet. gcn_train.py needs to track these four "
+              f"values (CV C-index and CV IBS, mean and std across the "
+              f"5 folds it already trains) and include them in its "
+              f"returned dict. Showing baseline-vs-baseline CV only "
+              f"until then.")
 
-    return {"binary": binary_results, "survival": surv_results}
+    _print_cv_summary(cv_results, gcn_cv_row)
+    _plot_cv_metrics(cv_results, gcn_cv_row, output_dir)
+
+    return {
+        "single_split": all_results,
+        "cv": cv_results,
+        "gcn_cv": gcn_cv_row,
+    }

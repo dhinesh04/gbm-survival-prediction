@@ -1,84 +1,70 @@
-"""
-config.py
----------
-Single source of truth for every hyperparameter used across the pipeline.
-"""
+"""Single source of truth for hyperparameters used across the pipeline."""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. REPRODUCIBILITY
-# ─────────────────────────────────────────────────────────────────────────────
-RANDOM_STATE   = 42
+RANDOM_STATE = 42
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. DATA PATHS
-# ─────────────────────────────────────────────────────────────────────────────
+# data paths
 RAW_DATA_DIR      = "cbioportal_data"
 DEFAULT_DATA_DIR  = "data"
 DEFAULT_PLOTS_DIR = "plots"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. LTS THRESHOLD EXPERIMENT
-# ─────────────────────────────────────────────────────────────────────────────
+# LTS threshold experiment - kept for older modules; gcn_train.py stratifies
+# CV on event status (deceased vs censored) instead
 LTS_THRESHOLDS    = [12, 18, 24]
 DEFAULT_THRESHOLD = 24
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. TRAIN / TEST SPLIT
-# ─────────────────────────────────────────────────────────────────────────────
-TEST_SIZE      = 0.30
+TEST_SIZE = 0.30
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. mRMR FEATURE SELECTION
-# ─────────────────────────────────────────────────────────────────────────────
-K_MRMR         = 50
+# mRMR feature selection
+K_MRMR = 50
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. SNF — PATIENT SIMILARITY NETWORK
-# ─────────────────────────────────────────────────────────────────────────────
-K_SNF          = 20
-MU_SNF         = 0.5
-N_ITER_SNF     = 20
+# SNF - patient similarity network
+K_SNF      = 20
+MU_SNF     = 0.5
+N_ITER_SNF = 20
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. PSN DIAGNOSTICS
-# ─────────────────────────────────────────────────────────────────────────────
+# PSN diagnostics
 N_PERMUTATIONS = 1000
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. SURVIVAL-AWARE PSN BLEND
-# ─────────────────────────────────────────────────────────────────────────────
-ALPHA_SURVIVAL = 0.2
+# survival-aware PSN blend
+ALPHA_SURVIVAL = 0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. GCN ARCHITECTURE
-# ─────────────────────────────────────────────────────────────────────────────
-HIDDEN_DIM     = 64          # hidden units in each GCN layer
-DROPOUT        = 0.5         # dropout rate applied after each GCN layer
+# GCN architecture
+HIDDEN_DIM = 64   # hidden units per GCN layer
+DROPOUT    = 0.5  # dropout after each GCN layer
 
-# Per-modality encoder output dimension.
-# Each omics/clinical block is independently projected from its raw dimension
-# into ENC_DIM before concatenation and graph convolution.  This lets each
-# modality learn its own representation space, which is important because
-# CNA (discrete copy ratios), mRNA (log-expression), and methylation
-# (β-values in [0,1]) have fundamentally different statistical distributions.
-# With 4 modalities and ENC_DIM=32: GCN input = 32 × 4 = 128 dims.
-# Set to None to disable modality encoders (plain concatenation, ablation A7).
-ENC_DIM        = 32
+# per-modality encoder output dim; each omics/clinical block is projected to
+# ENC_DIM before concat + graph conv, since CNA/mRNA/methylation live on very
+# different scales. With 4 modalities: GCN input = ENC_DIM * 4.
+# Set to None to disable encoders (plain concat, ablation A7).
+ENC_DIM = 32
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. GCN TRAINING
-# ─────────────────────────────────────────────────────────────────────────────
-LR             = 0.001
-WEIGHT_DECAY   = 0.01
-EPOCHS         = 500
-PATIENCE       = 30
-MIN_EPOCHS     = 80
-N_FOLDS        = 5
-ADJ_THRESHOLD  = 0.0
-K_TEST         = 10
+# modality fusion, used when all 4 modalities are present:
+#   "none"            - plain concat, no learned fusion
+#   "attention"        - ModalityAttentionFusion, learned-query pooling attention (not self-attention)
+#   "omics_self_attn"  - real self-attention over CNA/mRNA/Meth only, clinical concatenated in after (mirrors MoACG, Qin et al. 2026)
+FUSION_TYPE    = "omics_self_attn"
+N_FUSION_HEADS = 4  # only used when FUSION_TYPE == "attention"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 11. JOINT LOSS WEIGHTS
-# ─────────────────────────────────────────────────────────────────────────────
-ALPHA_BIN      = 0.5
-ALPHA_COX      = 2.0
+# GCN training
+LR            = 0.001
+WEIGHT_DECAY  = 0.01
+EPOCHS        = 500
+PATIENCE      = 30
+MIN_EPOCHS    = 80
+N_FOLDS       = 5
+ADJ_THRESHOLD = 0.0
+K_TEST        = 10
+
+# joint loss weights - legacy fixed defaults, still used by ablation_studies.py
+# and baseline_comparison.py. gcn_train.py ignores these and grid-searches
+# ALPHA_AFT_GRID x ALPHA_COX_GRID via nested 5-fold CV instead.
+ALPHA_AFT = 0.5
+ALPHA_COX = 2.0
+
+# grid searched in gcn_train.py: 4x4x5 folds + 1 final retrain
+ALPHA_AFT_GRID = [0.25, 0.5, 1.0, 2.0]
+ALPHA_COX_GRID = [0.5, 1.0, 2.0, 4.0]
+
+# metric used to pick the winning (alpha_aft, alpha_cox) pair: "mae" (AFT's
+# native metric, default) or "cindex"
+SELECTION_METRIC = "mae"
