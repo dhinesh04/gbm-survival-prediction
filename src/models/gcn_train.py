@@ -1,34 +1,20 @@
-"""
-gcn_train.py
-------------
-Log-normal AFT regression + Cox survival dual-head GCN.
-
-Changes in this version:
-  - AFT head is now a proper log-normal AFT: log(T) ~ Normal(mu(x), sigma^2),
-    where mu(x) = fc_reg(H) (per-patient) and sigma = exp(model.log_sigma)
-    is a single GLOBAL scalar learned jointly with the network. Loss is the
-    true negative log-likelihood (PDF for events, survival function for
-    censored) — see src/utils.py: aft_loss(). This replaces the earlier
-    fixed-variance squared-error approximation.
-  - alpha_AFT / alpha_COX are no longer fixed config values. gcn_train.py
-    runs a NESTED grid search: for every (alpha_aft, alpha_cox) candidate
-    in ALPHA_AFT_GRID x ALPHA_COX_GRID, a full 5-fold CV is run; the pair
-    with the best SELECTION_METRIC (default: lowest CV MAE) is selected,
-    then used for the final retrain on all training patients.
-  - NO LTS / threshold logic anywhere in this file. 5-fold CV is stratified
-    on event status (deceased vs censored), not on any survival-time cutoff.
-    threshold_sensitivity() and all AUC-at-threshold code has been removed.
-  - Per-fold PSN rebuild retained (CV leakage fix).
-  - Modality-aware encoders retained.
-"""
-
-import math
+"""Log-normal AFT regression + Cox survival dual-head GCN, with a nested
+alpha_aft/alpha_cox grid search over 5-fold CV (stratified on event status,
+no LTS/threshold logic). Per-fold PSN is rebuilt on fold-train only to avoid
+CV leakage, and MAE/C-index/IBS are all reported at the same best-val-loss
+epoch. IBS time grid upper bound uses the overall max time (event + censored)
+of the fold's train portion, not just the max event time, since a fold whose
+longest follow-up is a censored patient would otherwise get an invalid grid."""
+import os
 import itertools
 import numpy as np
 import pandas as pd
 import torch
 import snf as snflib
+from scipy.stats import norm
 from sklearn.model_selection import StratifiedKFold
+from sksurv.metrics import integrated_brier_score
+from sksurv.util import Surv
 from lifelines.statistics import logrank_test
 from src.models.gcn_model import GCN
 from src.graph.survival_aware_psn import build_survival_aware_psn
@@ -52,9 +38,14 @@ from src.utils import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PSN BUILD HELPER
-# ─────────────────────────────────────────────────────────────────────────────
+def _build_model(n_in, modality_dims):
+    return GCN(
+        n_in=n_in, n_hid=HIDDEN_DIM, dropout=DROPOUT,
+        modality_dims=modality_dims, enc_dim=ENC_DIM,
+        fusion_type="omics_self_attn",
+    )
+
+
 def _build_fold_psn(cna, mrna, meth, os_months, os_status):
     """Build survival-aware PSN on fold-train patients only (CV leakage fix)."""
     affinities = [snflib.make_affinity(m, K=K_SNF, mu=MU_SNF)
@@ -69,25 +60,31 @@ def _build_fold_psn(cna, mrna, meth, os_months, os_status):
     return psn_omics
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# REGRESSION METRICS  (threshold-free — primary evaluation of the AFT head)
-# ─────────────────────────────────────────────────────────────────────────────
+def _build_fold_ibs_grid(tr_times, tr_events, val_times, val_events, n_points=50):
+    """IBS-valid time grid for one CV fold. Upper bound uses the overall max
+    time (event + censored) of the fold's train portion, since IPCW needs
+    every grid point strictly below it and event-only bounds can exceed that.
+    Returns (None, None, None) if the fold's time ranges don't admit a valid grid."""
+    try:
+        ft_min_bound = max(tr_times[tr_events == 1].min(),
+                           val_times[val_events == 1].min())
+        ft_max_bound = min(tr_times.max(), val_times.max())
+        margin = max(0.1, 0.01 * (ft_max_bound - ft_min_bound))
+        ft_min, ft_max = ft_min_bound + margin, ft_max_bound - margin
+        if ft_max <= ft_min:
+            return None, None, None
+        time_grid = np.linspace(ft_min, ft_max, n_points)
+        y_tr_sksurv  = Surv.from_arrays(event=tr_events.astype(bool),  time=tr_times)
+        y_val_sksurv = Surv.from_arrays(event=val_events.astype(bool), time=val_times)
+        return time_grid, y_tr_sksurv, y_val_sksurv
+    except Exception:
+        return None, None, None
+
+
 def get_regression_metrics(pred_months: np.ndarray,
                            times: np.ndarray,
                            events: np.ndarray) -> dict:
-    """
-    Evaluate AFT regression head predictions. No threshold required.
-
-    Parameters
-    ----------
-    pred_months : (N,) predicted survival months  [exp of mu = log t-hat]
-    times       : (N,) actual survival / censoring months
-    events      : (N,) 1 = deceased, 0 = censored
-
-    Returns
-    -------
-    dict of metric → value
-    """
+    """Threshold-free evaluation of AFT head predictions (deceased patients only)."""
     uncensored = events == 1
 
     if uncensored.sum() > 0:
@@ -109,31 +106,11 @@ def get_regression_metrics(pred_months: np.ndarray,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PER-PATIENT PREDICTION TABLE  (threshold-free — no binary label involved)
-# ─────────────────────────────────────────────────────────────────────────────
 def get_patient_predictions(results: dict, gcn_results: dict) -> pd.DataFrame:
-    """
-    Build a per-patient comparison of AFT-predicted survival time against
-    actual OS_MONTHS, for the held-out test set. No threshold or binary
-    label is used anywhere in this function.
+    """Per-patient AFT-predicted vs. actual OS_MONTHS on the held-out test set.
 
-    Row order assumption: gcn_results["pred_months"] / ["times_test"] /
-    ["events_test"] preserve the same patient order as
-    results["os_months_test"] — true throughout this pipeline since mRMR
-    and PSN construction never reorder rows, only select/transform columns.
-
-    Returns
-    -------
-    pd.DataFrame indexed by PATIENT_ID, columns:
-        predicted_months     : exp(mu) from the AFT head
-        actual_months        : OS_MONTHS (exact if deceased, lower bound if censored)
-        event                : 1 = deceased (exact ground truth), 0 = censored (lower bound only)
-        signed_error_months  : predicted - actual (sign shows over/under-prediction)
-        abs_error_months     : |signed_error|, NaN for censored patients
-        censoring_consistent : for censored patients only — True if predicted_months
-                                >= actual_months, NaN for deceased patients
-        risk_score            : Cox head output, included for cross-reference only
+    Assumes gcn_results' arrays preserve results["os_months_test"]'s row order,
+    which holds since mRMR/PSN construction never reorder rows.
     """
     patient_ids = results["os_months_test"].index
 
@@ -155,32 +132,16 @@ def get_patient_predictions(results: dict, gcn_results: dict) -> pd.DataFrame:
     return df.sort_values("abs_error_months", ascending=False, na_position="last")
 
 
-def print_patient_predictions(df: pd.DataFrame, n: int = 20):
-    """Print the n deceased patients with the largest absolute error."""
-    deceased_df = df[df["event"] == 1]
-    censored_df = df[df["event"] == 0]
-
-    print(f"\n── Per-Patient Predictions — Largest errors "
-          f"(top {n} of {len(deceased_df)} deceased) ──────────")
-    print(f"  {'Patient ID':<14} {'Pred (m)':>9} {'Actual (m)':>11} "
-          f"{'Abs Err (m)':>12} {'Risk score':>11}")
-    print("  " + "-" * 62)
-    for pid, row in deceased_df.head(n).iterrows():
-        print(f"  {pid:<14} {row['predicted_months']:>9.1f} "
-              f"{row['actual_months']:>11.1f} "
-              f"{row['abs_error_months']:>12.1f} "
-              f"{row['risk_score']:>11.3f}")
-
-    n_bad_censored = int((~censored_df["censoring_consistent"].astype(bool)).sum())
-    print(f"\n  Censored patients: {len(censored_df)} total, "
-          f"{n_bad_censored} with predicted time SHORTER than observed "
-          f"censoring time (logically inconsistent)")
-    print("  " + "-" * 62)
+def save_patient_predictions(results: dict, gcn_results: dict,
+                             output_dir: str = "plots") -> pd.DataFrame:
+    """Save get_patient_predictions() output to {output_dir}/patient_predictions.csv."""
+    df = get_patient_predictions(results, gcn_results)
+    path = os.path.join(output_dir, "patient_predictions.csv")
+    df.to_csv(path)
+    print(f"\n  Patient predictions saved → {path}")
+    return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRINT HELPER
-# ─────────────────────────────────────────────────────────────────────────────
 def _print_final(epochs_used, reg_m, cindex, cindex_aft,
                  risk_scores, times, events, sigma):
     print(f"\n── Final Test Results (epochs used: {epochs_used}) ────────────")
@@ -211,61 +172,52 @@ def _print_final(epochs_used, reg_m, cindex, cindex_aft,
     print("────────────────────────────────────────────────────────────")
 
 
-def _print_grid_summary(grid_results: list, selection_metric: str):
-    """Print every (alpha_aft, alpha_cox) candidate, sorted best-first."""
-    print(f"\n── α Grid Search — Summary (sorted by {selection_metric}) "
-          f"────────────────────")
-    if selection_metric == "cindex":
-        ordered = sorted(grid_results, key=lambda r: r["cv_cindex_mean"], reverse=True)
-    else:
-        ordered = sorted(grid_results, key=lambda r: r["cv_mae_mean"])
+def _print_grid_summary(grid_results: list, selection_metric: str, best: dict):
+    print(f"\n── α Grid Search — Summary (sorted by mae) ────────────────────")
+    ordered = sorted(grid_results, key=lambda r: r["cv_mae_mean"])
 
     print(f"  {'α_AFT':>6} {'α_Cox':>6}  {'CV MAE (m)':>14}  "
-          f"{'CV C-index':>14}  {'epochs':>7}")
-    print("  " + "-" * 58)
-    for i, r in enumerate(ordered):
-        marker = "  ★ best" if i == 0 else ""
+          f"{'CV C-index':>14}  {'CV IBS':>14}  {'epochs':>7}")
+    print("  " + "-" * 76)
+    for r in ordered:
+        marker = ("  ★ best" if (r["alpha_aft"] == best["alpha_aft"]
+                                 and r["alpha_cox"] == best["alpha_cox"]) else "")
         print(f"  {r['alpha_aft']:>6} {r['alpha_cox']:>6}  "
               f"{r['cv_mae_mean']:>6.2f}±{r['cv_mae_std']:<5.2f} "
               f"  {r['cv_cindex_mean']:>6.4f}±{r['cv_cindex_std']:<5.4f} "
+              f"  {r['cv_ibs_mean']:>6.4f}±{r['cv_ibs_std']:<5.4f} "
               f" {r['median_epochs']:>7}{marker}")
-    print("  " + "-" * 58)
+    print("  " + "-" * 76)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SINGLE FOLD TRAINING
-# ─────────────────────────────────────────────────────────────────────────────
 def _train_one_fold(X_all, adj, times_all, events_all,
                     idx_fold_train, idx_fold_val,
                     alpha_aft, alpha_cox,
                     modality_dims=None):
-    """
-    Train one CV fold with AFT (log-normal NLL) + Cox joint loss, for one
-    (alpha_aft, alpha_cox) candidate pair.
-
-    Model selection within the fold: minimises combined validation loss
-    (alpha_aft * AFT_NLL + alpha_cox * Cox_loss).
-
-    Returns
-    -------
-    best_val_mae    : float   MAE at the best-val-loss epoch
-    best_val_cindex : float   Cox C-index at the best-val-loss epoch
-    best_epoch      : int     epoch number of the best val state
-    """
-    model = GCN(
-        n_in=X_all.shape[1], n_hid=HIDDEN_DIM, dropout=DROPOUT,
-        modality_dims=modality_dims, enc_dim=ENC_DIM,
-    )
+    """Train one CV fold with AFT+Cox joint loss for one (alpha_aft, alpha_cox)
+    pair. Model selection picks the epoch with lowest combined validation
+    loss; MAE/C-index/IBS are all reported from that same epoch.
+    Returns (best_val_mae, best_val_cindex, best_val_ibs, best_epoch)."""
+    model = _build_model(X_all.shape[1], modality_dims)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    # time grid is fixed per fold since times/events don't change across epochs
+    grid_tr_t = times_all[idx_fold_train].cpu().numpy()
+    grid_tr_e = events_all[idx_fold_train].cpu().numpy()
+    grid_val_t = times_all[idx_fold_val].cpu().numpy()
+    grid_val_e = events_all[idx_fold_val].cpu().numpy()
+    fold_time_grid, y_fold_tr_sksurv, y_fold_val_sksurv = _build_fold_ibs_grid(
+        grid_tr_t, grid_tr_e, grid_val_t, grid_val_e
+    )
 
     best_val_loss   = float('inf')
     best_val_mae    = float('inf')
     best_val_cindex = 0.5
+    best_val_ibs    = float('nan')
     best_epoch      = MIN_EPOCHS
     bad_counter     = 0
 
     for epoch in range(EPOCHS):
-        # ── Training ──────────────────────────────────────────────────────────
         model.train()
         optimizer.zero_grad()
         pred_log_t, cox_risk, _ = model(X_all, adj)
@@ -285,7 +237,6 @@ def _train_one_fold(X_all, adj, times_all, events_all,
         loss.backward()
         optimizer.step()
 
-        # ── Validation ────────────────────────────────────────────────────────
         model.eval()
         with torch.no_grad():
             pred_log_t_all, cox_risk_all, _ = model(X_all, adj)
@@ -317,6 +268,18 @@ def _train_one_fold(X_all, adj, times_all, events_all,
             best_val_loss   = val_loss
             best_val_mae    = val_mae
             best_val_cindex = val_cindex
+
+            if fold_time_grid is not None:
+                try:
+                    sigma_val = float(model.sigma().item())
+                    mu_val    = val_pred_log_t.detach().cpu().numpy().reshape(-1, 1)
+                    surv_mat  = norm.sf(
+                        (np.log(fold_time_grid).reshape(1, -1) - mu_val) / sigma_val)
+                    best_val_ibs = integrated_brier_score(
+                        y_fold_tr_sksurv, y_fold_val_sksurv, surv_mat, fold_time_grid)
+                except Exception:
+                    best_val_ibs = float('nan')
+
             if epoch + 1 >= MIN_EPOCHS:
                 best_epoch = epoch + 1
             bad_counter = 0
@@ -326,30 +289,22 @@ def _train_one_fold(X_all, adj, times_all, events_all,
                 if bad_counter >= PATIENCE:
                     break
 
-    return best_val_mae, best_val_cindex, best_epoch
+    return best_val_mae, best_val_cindex, best_val_ibs, best_epoch
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CROSS-VALIDATION + NESTED ALPHA GRID SEARCH + FINAL EVALUATION
-# ─────────────────────────────────────────────────────────────────────────────
 def run_cross_validation(X_train_np, X_test_np,
                          psn_train,
                          cna_tr, mrna_tr, meth_tr,
                          times_train_np, events_train_np,
                          times_test_np,  events_test_np,
                          modality_dims=None):
-    """
-    Nested grid search over (alpha_aft, alpha_cox) via 5-fold CV per
-    candidate, then final retrain + test evaluation using the winning pair.
-
-    CV folds are stratified on event status (deceased vs censored) — no
-    LTS label or survival-time threshold is used anywhere in this function.
-    """
+    """Nested grid search over (alpha_aft, alpha_cox) via 5-fold CV (stratified
+    on event status), then final retrain + test evaluation on the winning pair."""
     n_train = X_train_np.shape[0]
     n_test  = X_test_np.shape[0]
     n_total = n_train + n_test
 
-    strat_labels = events_train_np.astype(int)   # stratify on event status only
+    strat_labels = events_train_np.astype(int)
 
     full_adj_final = attach_test_nodes(psn_train, X_train_np, X_test_np, k=K_TEST)
     adj_final      = normalise_adjacency(full_adj_final, threshold=ADJ_THRESHOLD)
@@ -360,6 +315,18 @@ def run_cross_validation(X_train_np, X_test_np,
     events_all_final = torch.tensor(
         np.concatenate([events_train_np, events_test_np]), dtype=torch.float)
     idx_test = torch.arange(n_train, n_total)
+
+    # per-modality input scale check, before any training
+    if modality_dims is not None:
+        X_np = X_all_final.numpy()
+        offset = 0
+        names = ["CNA", "mRNA", "Methylation", "Clinical"]
+        print("\n  Feature scale check (mean ± std per modality block):")
+        for name, d in zip(names, modality_dims):
+            block = X_np[:, offset:offset + d]
+            print(f"    {name:<12} mean={block.mean():8.3f}  std={block.std():8.3f}  "
+                  f"(min={block.min():.3f}, max={block.max():.3f})")
+            offset += d
 
     n_candidates = len(ALPHA_AFT_GRID) * len(ALPHA_COX_GRID)
     enc_info = (f"modality encoders {modality_dims}→{ENC_DIM}each"
@@ -379,7 +346,7 @@ def run_cross_validation(X_train_np, X_test_np,
 
     for alpha_aft, alpha_cox in itertools.product(ALPHA_AFT_GRID, ALPHA_COX_GRID):
         skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-        fold_maes, fold_cindices, fold_epochs = [], [], []
+        fold_maes, fold_cindices, fold_ibs, fold_epochs = [], [], [], []
 
         for tr_idx, val_idx in skf.split(X_train_np, strat_labels):
             fold_psn = _build_fold_psn(
@@ -408,7 +375,7 @@ def run_cross_validation(X_train_np, X_test_np,
             idx_fold_train = torch.arange(n_fold_tr)
             idx_fold_val_t = torch.arange(n_fold_tr, n_fold_tr + n_fold_val)
 
-            val_mae, val_cindex, best_ep = _train_one_fold(
+            val_mae, val_cindex, val_ibs, best_ep = _train_one_fold(
                 X_fold_all, fold_adj_t,
                 times_fold_all, events_fold_all,
                 idx_fold_train, idx_fold_val_t,
@@ -418,28 +385,41 @@ def run_cross_validation(X_train_np, X_test_np,
 
             fold_maes.append(val_mae)
             fold_cindices.append(val_cindex)
+            fold_ibs.append(val_ibs)
             fold_epochs.append(best_ep)
 
         mean_mae, std_mae = float(np.mean(fold_maes)), float(np.std(fold_maes))
         mean_ci,  std_ci  = float(np.mean(fold_cindices)), float(np.std(fold_cindices))
+        valid_ibs = [v for v in fold_ibs if not np.isnan(v)]
+        mean_ibs, std_ibs = ((float(np.mean(valid_ibs)), float(np.std(valid_ibs)))
+                            if valid_ibs else (float('nan'), float('nan')))
         median_epochs     = max(MIN_EPOCHS, int(np.median(fold_epochs)))
 
         grid_results.append({
             "alpha_aft": alpha_aft, "alpha_cox": alpha_cox,
             "cv_mae_mean": mean_mae, "cv_mae_std": std_mae,
             "cv_cindex_mean": mean_ci, "cv_cindex_std": std_ci,
+            "cv_ibs_mean": mean_ibs, "cv_ibs_std": std_ibs,
             "median_epochs": median_epochs,
         })
         print(f"  α_AFT={alpha_aft:<5} α_Cox={alpha_cox:<5}  "
               f"CV MAE={mean_mae:6.2f}±{std_mae:4.2f}m  "
-              f"CV C-idx={mean_ci:.4f}±{std_ci:.4f}  epochs≈{median_epochs}")
-
-    _print_grid_summary(grid_results, SELECTION_METRIC)
-
+              f"CV C-idx={mean_ci:.4f}±{std_ci:.4f}  "
+              f"CV IBS={mean_ibs:.4f}±{std_ibs:.4f}  epochs≈{median_epochs}")
+        
     if SELECTION_METRIC == "cindex":
         best = max(grid_results, key=lambda r: r["cv_cindex_mean"])
+    elif SELECTION_METRIC == "mae_cindex_floor":
+        # lowest MAE among candidates whose CV C-index clears chance (mean - std > 0.5);
+        # falls back to best-by-C-index so a noisy Cox head can't win just on MAE
+        reliable = [r for r in grid_results
+                if r["cv_cindex_mean"] - r["cv_cindex_std"] > 0.5]
+        best = (min(reliable, key=lambda r: r["cv_mae_mean"]) if reliable
+            else max(grid_results, key=lambda r: r["cv_cindex_mean"]))
     else:
         best = min(grid_results, key=lambda r: r["cv_mae_mean"])
+
+    _print_grid_summary(grid_results, SELECTION_METRIC, best)
 
     alpha_aft_best = best["alpha_aft"]
     alpha_cox_best = best["alpha_cox"]
@@ -447,16 +427,14 @@ def run_cross_validation(X_train_np, X_test_np,
 
     print(f"\n  ★ Selected: α_AFT={alpha_aft_best}  α_Cox={alpha_cox_best}  "
           f"(CV MAE={best['cv_mae_mean']:.2f}±{best['cv_mae_std']:.2f}m, "
-          f"CV C-idx={best['cv_cindex_mean']:.4f}±{best['cv_cindex_std']:.4f})")
+          f"CV C-idx={best['cv_cindex_mean']:.4f}±{best['cv_cindex_std']:.4f}, "
+          f"CV IBS={best['cv_ibs_mean']:.4f}±{best['cv_ibs_std']:.4f})")
 
-    # ── Final retraining on all training patients, winning alphas ──────────
+    # final retrain on all training patients, winning alphas
     print(f"\n── Final retraining on all {n_train} patients "
           f"({final_epochs} epochs, α_AFT={alpha_aft_best}, α_Cox={alpha_cox_best}) ──")
 
-    model = GCN(
-        n_in=X_all_final.shape[1], n_hid=HIDDEN_DIM, dropout=DROPOUT,
-        modality_dims=modality_dims, enc_dim=ENC_DIM,
-    )
+    model = _build_model(X_all_final.shape[1], modality_dims)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     idx_all_train = torch.arange(n_train)
 
@@ -486,7 +464,7 @@ def run_cross_validation(X_train_np, X_test_np,
                   f"(aft={l_aft.item():.4f}, cox={l_cox.item():.4f}, "
                   f"σ={model.sigma().item():.4f})")
 
-    # ── Test evaluation (touched exactly once) ─────────────────────────────
+    # test set is touched exactly once, here
     print("\n── Test Evaluation (touched exactly once) ───────────────────")
     model.eval()
     with torch.no_grad():
@@ -508,13 +486,15 @@ def run_cross_validation(X_train_np, X_test_np,
                  test_risk, test_times, test_events, final_sigma)
 
     print(f"\n  Learned σ (log-normal AFT scale): {final_sigma:.4f}")
-    print(f"  CV MAE (winning pair, mean±std): "
+    print(f"  CV MAE  (winning pair, mean±std): "
           f"{best['cv_mae_mean']:.2f} ± {best['cv_mae_std']:.2f} months")
-    print(f"  Final Test MAE:                  {reg_metrics['mae']:.2f} months")
+    print(f"  CV IBS  (winning pair, mean±std): "
+          f"{best['cv_ibs_mean']:.4f} ± {best['cv_ibs_std']:.4f}")
+    print(f"  Final Test MAE:                   {reg_metrics['mae']:.2f} months")
     gap  = abs(reg_metrics['mae'] - best['cv_mae_mean'])
     flag = ("✓ well-calibrated" if gap <  5.0 else
             "~ acceptable"      if gap < 10.0 else "✗ large gap")
-    print(f"  Gap (|test-val|):                {gap:.2f} months  {flag}")
+    print(f"  Gap (|test-val|):                 {gap:.2f} months  {flag}")
 
     return {
         **reg_metrics,
@@ -533,22 +513,19 @@ def run_cross_validation(X_train_np, X_test_np,
         "cv_val_mae_std":      best["cv_mae_std"],
         "cv_val_cindex_mean":  best["cv_cindex_mean"],
         "cv_val_cindex_std":   best["cv_cindex_std"],
+        "cv_val_ibs_mean":     best["cv_ibs_mean"],
+        "cv_val_ibs_std":      best["cv_ibs_std"],
         "final_epochs_used":   final_epochs,
+        "model":               model,
+        "X_all_final":         X_all_final,
+        "adj_final":           adj_final,
+        "events_all_final":    events_all_final.cpu().numpy()
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
 def train_gcn(results: dict) -> dict:
-    """
-    Train the GCN dual-head model (log-normal AFT regression + Cox), with
-    a nested grid search over the joint-loss weights (alpha_aft, alpha_cox).
-
-    No LTS label or threshold is read from `results` — only OS_MONTHS,
-    OS_STATUS, and the mRMR-reduced feature matrices are used. CV
-    stratification is on event status (deceased vs censored).
-    """
+    """Train the GCN dual-head model (AFT + Cox) with a nested grid search
+    over (alpha_aft, alpha_cox). CV is stratified on event status only."""
     torch.manual_seed(RANDOM_STATE)
     np.random.seed(RANDOM_STATE)
 

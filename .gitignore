@@ -1,4 +1,9 @@
 env/
+venv/
 __pycache__/
 outputs/
 src/data/data_*/
+src/data/*.csv
+cbioportal_data/
+.DS_Store
+*.xlsx

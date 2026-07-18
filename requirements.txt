@@ -11,3 +11,6 @@ matplotlib
 pycox
 scikit-survival
 torchtuples
+captum
+openpyxl
+seaborn

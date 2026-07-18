@@ -1,36 +1,5 @@
-"""
-driver_gene_analysis.py
------------------------
-Addresses the question: "Which genes drive risk?"
-
-Two analyses are run against the 27 GBM driver genes identified by
-Brennan et al. (2013, Cell) from the same TCGA-GBM Firehose Legacy cohort:
-
-  1. mRMR Retention Check
-     Reports which driver genes were independently selected by mRMR
-     as high-relevance, low-redundancy features for LTS prediction.
-     This shows whether the model's unsupervised feature selection
-     agrees with established oncogenic drivers.
-
-  2. Univariate Cox Hazard Analysis
-     For every driver gene present in CNA, mRNA or methylation data,
-     fits a penalised CoxPH model (univariate) on ALL patients and
-     reports the hazard ratio (HR), 95% CI, and p-value.
-     HR > 1  ->  gene associated with higher risk (shorter survival)
-     HR < 1  ->  gene associated with lower risk  (protective / LTS)
-
-Output
-------
-  plots/driver_gene_forest.png       — forest plot of all significant HRs
-  plots/driver_gene_mrmr.png         — bar chart of mRMR retention counts
-  Console summary table
-
-Reference
----------
-  Brennan CW et al. The somatic genomic landscape of glioblastoma.
-  Cell 155(2):462-477, 2013. doi:10.1016/j.cell.2013.09.034
-  (Same TCGA-GBM cohort as this study)
-"""
+"""Univariate Cox hazard analysis against the 27 GBM driver genes from
+Brennan et al. 2013 (Cell), same TCGA-GBM cohort as this study."""
 
 import os
 import warnings
@@ -43,9 +12,7 @@ import matplotlib.patches as mpatches
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DRIVER GENE PANEL  (Brennan et al. 2013 — bold = most recurrently altered)
-# ─────────────────────────────────────────────────────────────────────────────
+# Brennan et al. 2013 driver gene panel
 DRIVER_GENES = [
     "ARID2", "ATRX",  "BRAF",    "CDKN2A", "CIC",     "DNMT3A",
     "EGFR",  "FGFR2", "FUBP1",   "IDH1",   "IDH2",    "KDR",
@@ -59,19 +26,11 @@ BOLD_GENES = {"ATRX", "BRAF", "CDKN2A", "EGFR", "IDH1",
               "IDH2", "KRAS", "PTEN", "TP53"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER: fuzzy gene match (handles minor formatting differences)
-# ─────────────────────────────────────────────────────────────────────────────
 def _find_gene_in_columns(gene: str, columns):
-    """
-    Return the exact column name matching a driver gene, or None.
-    Handles exact match and common suffixes (e.g. 'EGFR|1956', 'EGFR_mut').
-    """
+    """Match a driver gene to its column name, handling suffixes like 'EGFR|1956' or 'EGFR_mut'."""
     cols = list(columns)
-    # Exact match first
     if gene in cols:
         return gene
-    # Prefix match  e.g. 'EGFR|1956' or 'EGFR_something'
     for c in cols:
         if c.startswith(gene + "|") or c.startswith(gene + "_"):
             return c
@@ -79,9 +38,7 @@ def _find_gene_in_columns(gene: str, columns):
             return c
     return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ANALYSIS 2: UNIVARIATE COX HAZARD RATIO
-# ─────────────────────────────────────────────────────────────────────────────
+
 def run_univariate_cox(
     X_cna:       pd.DataFrame,
     X_mrna:      pd.DataFrame,
@@ -89,22 +46,10 @@ def run_univariate_cox(
     X_mut: pd.DataFrame,
     os_months:   pd.Series,
     os_status:   pd.Series,
+    gene_list:   list = None,
 ) -> pd.DataFrame:
-    """
-    Univariate penalised CoxPH for each driver gene across all modalities.
-    Uses the full patient cohort (all patients, not just train/test split)
-    since this is a biological validation analysis, not model evaluation.
-
-    Parameters
-    ----------
-    X_cna, X_mrna, X_meth : full (unfiltered) DataFrames, patients × genes
-    os_months, os_status  : survival data for all patients
-
-    Returns
-    -------
-    pd.DataFrame with one row per (gene, modality) pair found in the data.
-    Columns: gene, modality, col_name, HR, CI_low, CI_high, p_value, neg_log10_p
-    """
+    """Univariate penalised CoxPH per driver gene across all modalities, fit on
+    the full cohort (biological validation, not model evaluation)."""
     from lifelines import CoxPHFitter
 
     modalities = [
@@ -125,7 +70,7 @@ def run_univariate_cox(
     e = os_status.loc[common_idx].values.astype(float)
 
     results = []
-    for gene in DRIVER_GENES:
+    for gene in (gene_list if gene_list is not None else DRIVER_GENES):
         for mod_name, X in modalities:
             X_aligned = X.loc[common_idx] if X.index.isin(common_idx).any() else X
 
@@ -135,8 +80,7 @@ def run_univariate_cox(
 
             feature = X_aligned[col].values.astype(float)
 
-            # Skip if constant (no variation to model)
-            if np.std(feature) < 1e-8:
+            if np.std(feature) < 1e-8:  # no variation to model
                 continue
 
             df_cox = pd.DataFrame({
@@ -166,28 +110,19 @@ def run_univariate_cox(
                     "is_bold":     gene in BOLD_GENES,
                     "significant": pval < 0.05,
                 })
-            except Exception as ex:
-                # Skip genes where model fails to converge
-                pass
+            except Exception:
+                pass  # gene failed to converge, skip it
 
     df = pd.DataFrame(results)
     if df.empty:
         return df
 
-    # Keep best modality per gene (lowest p-value) for the forest plot
-    df = df.sort_values("p_value")
-    return df
+    return df.sort_values("p_value")
 
 
 def plot_forest(cox_df: pd.DataFrame, output_dir: str):
-    """
-    Forest plot of univariate Cox HRs for driver genes.
-
-    Shows one row per (gene, modality) that is statistically significant
-    (p < 0.05), plus up to 5 top non-significant results for context.
-    HR > 1 (right of dashed line) = higher risk / shorter survival.
-    HR < 1 (left of dashed line)  = protective / longer survival.
-    """
+    """Forest plot of univariate Cox HRs: significant (p<0.05) genes plus up
+    to 5 top non-significant ones for context."""
     if cox_df.empty:
         print("  No Cox results to plot.")
         return
@@ -261,11 +196,6 @@ def plot_forest(cox_df: pd.DataFrame, output_dir: str):
     return path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SUMMARY TABLES
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def _print_cox_summary(cox_df: pd.DataFrame):
     if cox_df.empty:
         print("  No Cox results.")
@@ -295,32 +225,12 @@ def _print_cox_summary(cox_df: pd.DataFrame):
     print("=" * 75)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
 def run_driver_gene_analysis(
     raw_data:         dict,
     output_dir:       str
 ) -> dict:
-    """
-    Run both driver gene analyses and save all plots.
-
-    Parameters
-    ----------
-    pipeline_results : dict from main.main() — must contain mRMR feature lists:
-                       'cna_features', 'mrna_features', 'meth_features'
-    raw_data         : dict with keys:
-                       'X_cna'      : pd.DataFrame — full CNA matrix (all patients)
-                       'X_mrna'     : pd.DataFrame — full mRNA matrix
-                       'X_meth'     : pd.DataFrame — full methylation matrix
-                       'os_months'  : pd.Series
-                       'os_status'  : pd.Series
-    output_dir       : directory for plots
-
-    Returns
-    -------
-    dict with 'retention_df' and 'cox_df'
-    """
+    """Run the univariate Cox driver-gene analysis and save the forest plot.
+    raw_data needs X_cna/X_mrna/X_meth/X_mut (full patient matrices), os_months, os_status."""
     os.makedirs(output_dir, exist_ok=True)
 
     print("\n" + "=" * 68)
@@ -328,14 +238,13 @@ def run_driver_gene_analysis(
     print(f"  Reference: Brennan et al. 2013 — {len(DRIVER_GENES)} GBM driver genes")
     print("=" * 68)
 
-    # ── Univariate Cox ────────────────────────────────────────────────────
     print("\n  Running univariate Cox for each driver gene "
           "across all modalities...")
     cox_df = run_univariate_cox(
         X_cna      = raw_data["X_cna"],
         X_mrna     = raw_data["X_mrna"],
         X_meth     = raw_data["X_meth"],
-        X_mut= raw_data["X_mut"],
+        X_mut      = raw_data["X_mut"],
         os_months  = raw_data["os_months"],
         os_status  = raw_data["os_status"],
     )

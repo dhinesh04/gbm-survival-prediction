@@ -1,23 +1,6 @@
-# data_processing.py
-# ------------------
 # Processes raw cBioPortal GBM files into clean train-ready CSVs.
-#
-# Output labels.csv contains three columns only: PATIENT_ID, OS_MONTHS, OS_STATUS.
-# No LTS binary label is computed here. The threshold-based LTS endpoint
-# (used for stratification and AUC reporting) is derived inline in the
-# training pipeline from OS_MONTHS and OS_STATUS.
-#
-# This means:
-#   - All patients with valid survival data are retained (no exclusions).
-#   - The same processed data works for any LTS threshold (12 / 18 / 24 m).
-#   - Data processing runs once; threshold sensitivity is handled downstream.
-#
-# Can be run standalone:
-#   python data_processing.py
-#
-# Or called programmatically:
-#   from data_processing import main as run_data_processing
-#   run_data_processing(output_dir="data/")
+# labels.csv has only PATIENT_ID/OS_MONTHS/OS_STATUS -- no LTS binary label,
+# that threshold is applied downstream so it can vary without re-running this.
 
 import argparse
 import pandas as pd
@@ -30,9 +13,6 @@ from sklearn.linear_model import BayesianRidge
 from config import RAW_DATA_DIR, DEFAULT_DATA_DIR
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 def to_pid(x: str) -> str:
     """Truncate full TCGA barcode to 12-char patient ID."""
     return str(x)[:12]
@@ -48,21 +28,10 @@ def os_status_to_binary(x):
     return np.nan
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 def main(raw_data_dir: str = RAW_DATA_DIR,
          output_dir:   str = DEFAULT_DATA_DIR,
          use_mutations: bool = False):
-    """
-    Process raw GBM files and save cleaned CSVs to output_dir.
-
-    labels.csv columns: PATIENT_ID, OS_MONTHS, OS_STATUS
-      OS_STATUS: 1 = deceased (event observed), 0 = censored (alive at last follow-up)
-
-    All patients with valid OS_MONTHS and OS_STATUS are retained.
-    No threshold-based exclusion is applied.
-    """
+    """Process raw GBM files and save cleaned CSVs to output_dir."""
     print("=" * 62)
     print(f"  Data Processing")
     print(f"  Raw data:   {raw_data_dir}/")
@@ -204,9 +173,7 @@ def main(raw_data_dir: str = RAW_DATA_DIR,
     mut_matrix.columns.name = None
     mut_matrix = mut_matrix.reset_index()
     gene_cols  = [c for c in mut_matrix.columns if c != "PATIENT_ID"]
-    keep_genes = gene_cols[mut_matrix[gene_cols].sum() >= MIN_MUT_PATIENTS].tolist() \
-        if False else \
-        [c for c in gene_cols if mut_matrix[c].sum() >= MIN_MUT_PATIENTS]
+    keep_genes = [c for c in gene_cols if mut_matrix[c].sum() >= MIN_MUT_PATIENTS]
     mut_matrix = mut_matrix[["PATIENT_ID"] + keep_genes]
 
     # ── Intersect patients across modalities ──────────────────────────────────
@@ -217,8 +184,6 @@ def main(raw_data_dir: str = RAW_DATA_DIR,
         & set(mrna_data["PATIENT_ID"])
         & set(methylation_data["PATIENT_ID"])
     )
-    if use_mutations:
-        common_ids = common_ids & set(mut_matrix["PATIENT_ID"])
 
     print(f"\nBefore modality intersection:")
     print(f"  labels:       {len(labels_df)} patients")
@@ -228,7 +193,8 @@ def main(raw_data_dir: str = RAW_DATA_DIR,
     print(f"  Methylation:  {len(methylation_data)} patients")
     if use_mutations:
         print(f"  Mutation:     {len(mut_matrix)} patients  "
-              f"({len(keep_genes)} genes, mut≥{MIN_MUT_PATIENTS})")
+              f"({len(keep_genes)} genes, mut≥{MIN_MUT_PATIENTS}) "
+              f"-- intersected with the core cohort below, never the reverse")
     else:
         print("  Mutation:     SKIPPED (use_mutations=False)")
 
@@ -238,7 +204,10 @@ def main(raw_data_dir: str = RAW_DATA_DIR,
     mrna_data        = mrna_data[mrna_data["PATIENT_ID"].isin(common_ids)].copy()
     methylation_data = methylation_data[methylation_data["PATIENT_ID"].isin(common_ids)].copy()
     if use_mutations:
-        mut_matrix   = mut_matrix[mut_matrix["PATIENT_ID"].isin(common_ids)].copy()
+        mut_common_ids = common_ids & set(mut_matrix["PATIENT_ID"])
+        mut_matrix     = mut_matrix[mut_matrix["PATIENT_ID"].isin(mut_common_ids)].copy()
+        print(f"  Mutation data: {len(mut_common_ids)}/{len(common_ids)} "
+              f"core-cohort patients have mutation coverage.")
 
     # Align all dataframes by PATIENT_ID
     all_dfs = [labels_df, clinical_df, cna_data, mrna_data, methylation_data]
@@ -298,9 +267,6 @@ def main(raw_data_dir: str = RAW_DATA_DIR,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Process raw GBM cBioPortal files into clean CSVs."
